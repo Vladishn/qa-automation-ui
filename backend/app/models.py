@@ -1,7 +1,9 @@
 # app/models.py
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Literal, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
 
 Channel = Literal["DEV", "QA", "STAGE", "PROD"]
 DomainType = Literal["FIRMWARE", "APP"]
@@ -82,31 +84,36 @@ class SessionModel:
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
 
-@dataclass
-class QuickSetStepModel:
+QuickSetStatus = Literal["pending", "running", "pass", "fail", "info"]
+QuickSetInputKind = Literal["continue", "boolean", "text"]
+
+
+class QuickSetStep(BaseModel):
     name: str
-    status: str = "pending"
+    status: QuickSetStatus
     timestamp: Optional[datetime] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass
-class QuickSetQuestionModel:
+class QuickSetQuestion(BaseModel):
     id: str
     prompt: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    step_name: str
+    input_kind: QuickSetInputKind
+    choices: Optional[List[str]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass
-class QuickSetSessionModel:
+class QuickSetSession(BaseModel):
     session_id: str
     tester_id: str
     stb_ip: str
     scenario_name: str
     start_time: datetime
     end_time: Optional[datetime] = None
-    steps: List[QuickSetStepModel] = field(default_factory=list)
-    result: Optional[str] = None
-    logs: Dict[str, str] = field(default_factory=lambda: {"adb": "", "logcat": ""})
+    steps: List[QuickSetStep] = Field(default_factory=list)
+    result: Optional[QuickSetStatus] = None
+    logs: Dict[str, str] = Field(default_factory=lambda: {"adb": "", "logcat": ""})
     state: str = "running"
-    pending_question: Optional[QuickSetQuestionModel] = None
+    pending_question: Optional[QuickSetQuestion] = None
+    summary: Optional[str] = None

@@ -12,14 +12,20 @@ from .models import (
     Channel,
     DomainType,
     PlatformModel,
-    QuickSetQuestionModel,
-    QuickSetSessionModel,
-    QuickSetStepModel,
+    QuickSetQuestion,
+    QuickSetSession,
+    QuickSetStep,
     SessionModel,
     TestIssueModel,
     TestRunModel,
     VersionModel,
 )
+
+
+@dataclass
+class QuickSetRuntime:
+    answer_event: Event = field(default_factory=Event)
+    answer_value: Optional[str] = None
 
 
 def _version_key(label: str) -> Iterable[int]:
@@ -218,111 +224,148 @@ storage = InMemoryStorage()
 
 
 class QuickSetSessionStore:
-    """Stores QuickSet scenario sessions in memory."""
+    """Thread-safe storage for QuickSet sessions and runtimes."""
 
     def __init__(self) -> None:
-        self._sessions: Dict[str, QuickSetSessionModel] = {}
-        self._lock = Lock()
+        self._sessions: Dict[str, QuickSetSession] = {}
         self._runtime: Dict[str, QuickSetRuntime] = {}
+        self._lock = Lock()
 
-    def create_session(
-        self,
-        tester_id: str,
-        stb_ip: str,
-        scenario_name: str,
-        steps: List[QuickSetStepModel],
-    ) -> QuickSetSessionModel:
-        session = QuickSetSessionModel(
-            session_id=f"QS_{uuid4().hex[:8]}",
+    def _save(self, session_id: str, session: QuickSetSession) -> None:
+        self._sessions[session_id] = session
+
+    @staticmethod
+    def _maybe_update_summary(session: QuickSetSession, step: QuickSetStep) -> QuickSetSession:
+        if step.name == "analysis_summary":
+            analysis = step.metadata.get("analysis")
+            if isinstance(analysis, str):
+                trimmed = analysis.strip()
+                if trimmed:
+                    return session.model_copy(update={"summary": trimmed})
+        return session
+
+    def create_session(self, tester_id: str, stb_ip: str, scenario_name: str) -> QuickSetSession:
+        session_id = f"QS_{uuid4().hex[:8].upper()}"
+        session = QuickSetSession(
+            session_id=session_id,
             tester_id=tester_id,
             stb_ip=stb_ip,
             scenario_name=scenario_name,
             start_time=datetime.utcnow(),
-            steps=steps,
-            result="pending",
+            steps=[],
+            logs={"adb": "", "logcat": ""},
             state="running",
         )
         with self._lock:
-            self._sessions[session.session_id] = session
-        return session
+            self._save(session_id, session)
+        return session.model_copy(deep=True)
 
-    def get_session(self, session_id: str) -> Optional[QuickSetSessionModel]:
+    def get_session(self, session_id: str) -> Optional[QuickSetSession]:
         with self._lock:
-            return self._sessions.get(session_id)
+            session = self._sessions.get(session_id)
+            return session.model_copy(deep=True) if session else None
 
-    def upsert_step(self, session_id: str, step: QuickSetStepModel) -> None:
+    def append_step(self, session_id: str, step: QuickSetStep) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
             if not session:
                 return
-            for idx, existing in enumerate(session.steps):
-                if existing.name == step.name:
-                    session.steps[idx] = step
-                    break
-            else:
-                session.steps.append(step)
+            updated = session.model_copy(update={"steps": [*session.steps, step]})
+            updated = self._maybe_update_summary(updated, step)
+            self._save(session_id, updated)
 
-    def set_status(self, session_id: str, status: str) -> None:
+    def replace_step(self, session_id: str, step_name: str, step: QuickSetStep) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
-            if session:
-                session.result = status
+            if not session:
+                return
+            steps = list(session.steps)
+            for idx, existing in enumerate(steps):
+                if existing.name == step_name:
+                    steps[idx] = step
+                    break
+            else:
+                steps.append(step)
+            updated = session.model_copy(update={"steps": steps})
+            updated = self._maybe_update_summary(updated, step)
+            self._save(session_id, updated)
 
     def set_state(self, session_id: str, state: str) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
-            if session:
-                session.state = state
+            if not session:
+                return
+            updated = session.model_copy(update={"state": state})
+            self._save(session_id, updated)
 
-    def set_pending_question(self, session_id: str, question: QuickSetQuestionModel) -> None:
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session:
-                session.pending_question = question
-                session.state = "awaiting_input"
-
-    def clear_pending_question(self, session_id: str) -> None:
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session:
-                session.pending_question = None
-                if session.state != "completed":
-                    session.state = "running"
-
-    def complete_session(
-        self,
-        session_id: str,
-        *,
-        result: str,
-        logs: Dict[str, str],
-    ) -> None:
+    def update_logs(self, session_id: str, logs: Dict[str, str]) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
             if not session:
                 return
-            session.result = result
-            session.end_time = datetime.utcnow()
-            session.logs.update(logs)
-            session.state = "completed"
-            session.pending_question = None
+            new_logs = {**session.logs, **logs}
+            updated = session.model_copy(update={"logs": new_logs})
+            self._save(session_id, updated)
 
-    def create_runtime(self, session_id: str) -> "QuickSetRuntime":
+    def finalize_session(self, session_id: str, result: str, logs: Dict[str, str]) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            updated = session.model_copy(
+                update={
+                    "result": result,
+                    "end_time": datetime.utcnow(),
+                    "logs": {**session.logs, **logs},
+                    "state": "completed",
+                    "pending_question": None,
+                }
+            )
+            self._save(session_id, updated)
+
+    def set_pending_question(self, session_id: str, question: QuickSetQuestion) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            updated = session.model_copy(update={"pending_question": question, "state": "awaiting_input"})
+            self._save(session_id, updated)
+
+    def clear_pending_question(self, session_id: str) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            new_state = session.state if session.state == "completed" else "running"
+            updated = session.model_copy(update={"pending_question": None, "state": new_state})
+            self._save(session_id, updated)
+
+    def create_quickset_runtime(self, session_id: str) -> QuickSetRuntime:
         runtime = QuickSetRuntime()
-        self._runtime[session_id] = runtime
-        return runtime
-
-    def get_runtime(self, session_id: str) -> "QuickSetRuntime":
-        runtime = self._runtime.get(session_id)
-        if runtime is None:
-            runtime = QuickSetRuntime()
+        with self._lock:
             self._runtime[session_id] = runtime
         return runtime
 
+    def get_quickset_runtime(self, session_id: str) -> QuickSetRuntime:
+        runtime = self._runtime.get(session_id)
+        if runtime is None:
+            raise KeyError(f"Runtime for session {session_id} not found")
+        return runtime
 
-@dataclass
-class QuickSetRuntime:
-    answer_event: Event = field(default_factory=Event)
-    answer_value: Optional[str] = None
+    def wait_for_answer(self, session_id: str, question: QuickSetQuestion) -> str:
+        runtime = self.get_quickset_runtime(session_id)
+        self.set_pending_question(session_id, question)
+        runtime.answer_value = None
+        runtime.answer_event.clear()
+        runtime.answer_event.wait()
+        answer = runtime.answer_value or ""
+        self.clear_pending_question(session_id)
+        return answer
+
+    def deliver_answer(self, session_id: str, answer: str) -> None:
+        runtime = self.get_quickset_runtime(session_id)
+        runtime.answer_value = answer
+        runtime.answer_event.set()
 
 
 quickset_session_store = QuickSetSessionStore()

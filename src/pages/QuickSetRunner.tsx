@@ -37,6 +37,7 @@ const getStatusClass = (label: string): string => {
   if (normalized === 'PASS') return 'status-pill status-pill--pass';
   if (normalized === 'FAIL') return 'status-pill status-pill--fail';
   if (normalized === 'RUNNING') return 'status-pill status-pill--running';
+  if (normalized === 'AWAITING INPUT') return 'status-pill status-pill--running';
   if (normalized === 'INFO') return 'status-pill status-pill--info';
   return 'status-pill';
 };
@@ -74,8 +75,9 @@ const QuickSetRunner: React.FC = () => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
   const [answerError, setAnswerError] = useState<string | null>(null);
-  const [pendingQuestion, setPendingQuestion] = useState<QuickSetQuestion | null>(null);
   const [answerText, setAnswerText] = useState('');
+  const [isAnswerSubmitting, setIsAnswerSubmitting] = useState(false);
+  const pendingQuestion = session?.pending_question ?? null;
 
   const scenarioName = 'TV_AUTO_SYNC' as const;
 
@@ -104,7 +106,6 @@ const QuickSetRunner: React.FC = () => {
       setSessionId(response.session_id);
       setActiveApiKey(form.apiKey);
       setSession(null);
-      setPendingQuestion(null);
       setAnswerText('');
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : 'Failed to run scenario');
@@ -128,11 +129,6 @@ const QuickSetRunner: React.FC = () => {
           return;
         }
         setSession(data);
-        if (data.state === 'awaiting_input' && data.pending_question) {
-          setPendingQuestion(data.pending_question);
-        } else {
-          setPendingQuestion(null);
-        }
         if (data.result && data.result !== 'pending' && data.result !== 'running') {
           if (intervalId) {
             window.clearInterval(intervalId);
@@ -161,40 +157,127 @@ const QuickSetRunner: React.FC = () => {
     };
   }, [sessionId, activeApiKey]);
 
+  useEffect(() => {
+    setAnswerText('');
+  }, [pendingQuestion?.id]);
+
   const resultLabel = useMemo(() => {
-    const normalized = (session?.result || '').toLowerCase();
-    if (normalized === 'pass') {
-      return 'PASS';
+    if (!session) {
+      return sessionId ? 'RUNNING' : '—';
     }
-    if (normalized === 'fail') {
-      return 'FAIL';
+
+    if (session.state === 'awaiting_input') {
+      return 'AWAITING INPUT';
     }
-    if (sessionId) {
+
+    if (session.state === 'running') {
       return 'RUNNING';
     }
-    return '—';
-  }, [session?.result, sessionId]);
 
-  const steps: QuickSetStep[] = session?.steps ?? []; // alias for readability
-
-  const handleSubmitAnswer = async () => {
-    if (!sessionId || !activeApiKey || !pendingQuestion) {
-      return;
+    if (session.state === 'completed' && session.result) {
+      return session.result.toUpperCase();
     }
-    const trimmed = answerText.trim();
-    if (!trimmed) {
+
+    if (session.result) {
+      return session.result.toUpperCase();
+    }
+
+    return (session.state || 'RUNNING').toUpperCase();
+  }, [session, sessionId]);
+
+  const steps: QuickSetStep[] = session?.steps ?? [];
+
+  const submitAnswer = async (value: string) => {
+    if (!sessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {
       return;
     }
     try {
       setAnswerError(null);
-      const updated = await answerQuestion(sessionId, activeApiKey, trimmed);
+      setIsAnswerSubmitting(true);
+      const updated = await answerQuestion(sessionId, activeApiKey, value);
       setSession(updated);
-      setPendingQuestion(updated.pending_question ?? null);
       setAnswerText('');
     } catch (error) {
       setAnswerError(error instanceof Error ? error.message : 'Failed to send answer');
+    } finally {
+      setIsAnswerSubmitting(false);
     }
   };
+
+  const renderQuestionControls = (question: QuickSetQuestion) => {
+    const disabled = isAnswerSubmitting || !sessionId || !activeApiKey;
+    if (question.input_kind === 'continue') {
+      return (
+        <div style={questionActionsStyle}>
+          <button type="button" className="sidebar-item" disabled={disabled} onClick={() => submitAnswer('')}>
+            {isAnswerSubmitting ? 'Submitting…' : 'Continue'}
+          </button>
+        </div>
+      );
+    }
+
+    if (question.input_kind === 'boolean') {
+      return (
+        <div style={questionActionsStyle}>
+          <button
+            type="button"
+            className="sidebar-item"
+            disabled={disabled}
+            onClick={() => submitAnswer('yes')}
+          >
+            Yes
+          </button>
+          <button
+            type="button"
+            className="sidebar-item"
+            disabled={disabled}
+            onClick={() => submitAnswer('no')}
+          >
+            No
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div style={questionActionsStyle}>
+        <input
+          type="text"
+          value={answerText}
+          onChange={(event) => setAnswerText(event.target.value)}
+          placeholder="Type your answer"
+          style={inlineInputStyle}
+          disabled={disabled}
+        />
+        <button
+          type="button"
+          className="sidebar-item"
+          disabled={disabled || !answerText.trim()}
+          onClick={() => submitAnswer(answerText.trim())}
+        >
+          {isAnswerSubmitting ? 'Submitting…' : 'Submit'}
+        </button>
+      </div>
+    );
+  };
+
+  const renderStepInfo = (step: QuickSetStep): React.ReactNode => {
+    if (pendingQuestion && pendingQuestion.step_name === step.name) {
+      return (
+        <div style={questionBlockStyle}>
+          <p className="hint" style={{ marginBottom: 8 }}>
+            {pendingQuestion.prompt}
+          </p>
+          {renderQuestionControls(pendingQuestion)}
+        </div>
+      );
+    }
+    return getStepInfo(step) || '—';
+  };
+
+  const sessionActive = Boolean(
+    session && sessionId && (session.state === 'running' || session.state === 'awaiting_input')
+  );
 
   return (
     <section>
@@ -218,30 +301,6 @@ const QuickSetRunner: React.FC = () => {
         <p className="hint" style={{ color: '#e67e22' }}>
           {answerError}
         </p>
-      )}
-
-      {pendingQuestion && (
-        <div className="card" style={{ marginBottom: 24 }}>
-          <h3>Tester Input Required</h3>
-          <p className="hint">{pendingQuestion.prompt}</p>
-          <textarea
-            value={answerText}
-            onChange={(event) => setAnswerText(event.target.value)}
-            rows={3}
-            style={textAreaStyle}
-            placeholder="Type your answer..."
-          />
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <button
-              type="button"
-              className="sidebar-item"
-              onClick={handleSubmitAnswer}
-              disabled={!answerText.trim()}
-            >
-              Submit Answer
-            </button>
-          </div>
-        </div>
       )}
 
       <div className="card" style={{ marginBottom: 24 }}>
@@ -284,8 +343,8 @@ const QuickSetRunner: React.FC = () => {
             Scenario
             <input type="text" value={scenarioName} disabled style={inputStyle} />
           </label>
-          <button type="submit" className="sidebar-item" disabled={isSubmitting}>
-            {isSubmitting ? 'Running…' : 'Run TV_AUTO_SYNC'}
+          <button type="submit" className="sidebar-item" disabled={isSubmitting || sessionActive}>
+            {isSubmitting ? 'Running…' : sessionActive ? 'Scenario Active' : 'Run TV_AUTO_SYNC'}
           </button>
         </form>
       </div>
@@ -302,6 +361,7 @@ const QuickSetRunner: React.FC = () => {
                 {resultLabel}
               </span>
             </p>
+            <p className="hint">Summary: {session?.summary || '—'}</p>
             <p className="hint">Started: {formatDateTime(session?.start_time)}</p>
             <p className="hint">Finished: {formatDateTime(session?.end_time)}</p>
           </div>
@@ -334,7 +394,7 @@ const QuickSetRunner: React.FC = () => {
                       <span className={getStatusClass(displayStatus)}>{displayStatus}</span>
                     </td>
                     <td>{formatDateTime(step.timestamp)}</td>
-                    <td>{getStepInfo(step) || '—'}</td>
+                    <td>{renderStepInfo(step)}</td>
                   </tr>
                 );
               })}
@@ -367,16 +427,24 @@ const inputStyle: React.CSSProperties = {
   marginTop: 4
 };
 
-const textAreaStyle: React.CSSProperties = {
-  width: '100%',
-  padding: '6px 10px',
-  borderRadius: 8,
-  border: '1px solid rgba(255,255,255,0.18)',
-  background: 'transparent',
-  color: 'inherit',
-  fontSize: 13,
-  marginTop: 4,
-  resize: 'vertical',
+const questionActionsStyle: React.CSSProperties = {
+  display: 'flex',
+  gap: 8,
+  alignItems: 'center',
+  flexWrap: 'wrap'
+};
+
+const inlineInputStyle: React.CSSProperties = {
+  ...inputStyle,
+  marginTop: 0,
+  flex: 1,
+  minWidth: 160
+};
+
+const questionBlockStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 8
 };
 
 export default QuickSetRunner;

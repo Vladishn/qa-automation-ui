@@ -102,7 +102,7 @@ export interface QuickSetStep {
   name: string;
   status: QuickSetStepStatus;
   timestamp?: string | null;
-  metadata: Record<string, unknown>;
+  metadata: Record<string, any>;
 }
 
 export type QuickSetResult = QuickSetStepStatus | null;
@@ -110,7 +110,10 @@ export type QuickSetResult = QuickSetStepStatus | null;
 export interface QuickSetQuestion {
   id: string;
   prompt: string;
-  metadata: Record<string, unknown>;
+  step_name: string;
+  input_kind: 'continue' | 'boolean' | 'text';
+  choices?: string[] | null;
+  metadata: Record<string, any>;
 }
 
 export interface QuickSetSession {
@@ -126,6 +129,7 @@ export interface QuickSetSession {
     adb: string;
     logcat: string;
   };
-  state?: string;
+  state?: 'running' | 'awaiting_input' | 'completed' | 'failed';
   pending_question?: QuickSetQuestion | null;
+  summary?: string | null;
 }
