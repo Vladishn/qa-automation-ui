@@ -1,0 +1,94 @@
+# File: knowledge/core/quickset_errors.yaml
+errors:
+  - id: ADB_CONNECTION_FAILED
+    title: ADB connection failed
+    description: Unable to reach the STB over ADB; no automation or logs available.
+    severity: error
+    suggested_actions:
+      - Verify the STB IP:PORT is correct and reachable from the test machine.
+      - Run "adb connect <ip:port>" manually and check for errors.
+      - Check network connectivity (same LAN, no VPN/firewall blocking ADB).
+      - If issue persists, restart the STB and repeat the test.
+
+  - id: LOG_CAPTURE_FAILED
+    title: Log capture failed
+    description: Unable to start or complete logcat capture; evidence may be missing.
+    severity: error
+    suggested_actions:
+      - Verify "adb logcat" works from the test machine for this STB.
+      - Check that there is enough disk space on the test machine.
+      - Retry the scenario; if this repeats, collect a manual bugreport and file a bug.
+
+  - id: NO_HDMI_DEVICE_FOUND
+    title: No HDMI device found
+    description: QuickSet could not detect a TV over HDMI/CEC during discovery.
+    severity: error
+    suggested_actions:
+      - Verify the TV is powered ON and connected to the correct HDMI port.
+      - Check that HDMI cable is fully plugged and not damaged.
+      - Try another HDMI port or cable.
+      - If other TVs work but this one does not, file a compatibility issue.
+
+  - id: BRAND_DETECTION_FAILED
+    title: Brand detection failed
+    description: Discovery ran but no tvBrandName or brand info was detected.
+    severity: error
+    suggested_actions:
+      - Confirm that the TV is supported by QuickSet for automatic brand detection.
+      - Try running Auto Sync again and observe whether any brand name briefly appears.
+      - If the brand is common (e.g. LG/Samsung/Sony) and still not detected, attach logs and open a bug.
+
+  - id: PAIRING_FAILED
+    title: Pairing / mapping failed
+    description: QuickSet AutoSync did not complete the pairing/mapping step successfully. Logs may show SDK crash, service not ready, or other pairing errors.
+    severity: error
+    suggested_actions:
+      - Restart the STB and run the TV Auto Sync flow again.
+      - If the TV brand is detected but pairing still fails, capture a full bugreport and logcat.
+      - Verify the installed version of PartnerRC / QuickSet and update if a newer build exists.
+      - Escalate to the QuickSet/Android owner with the bugreport attached if this is reproducible.
+
+  - id: VOLUME_MAPPING_FAILED
+    title: Volume mapping failed
+    description: Volume keys were not mapped to the TV despite successful discovery/pairing.
+    severity: error
+    suggested_actions:
+      - Confirm that the tester really sees the TV volume OSD, not the STB OSD.
+      - Rerun Auto Sync and verify volume behavior again.
+      - If logs show success but behavior is wrong, open a bug (likely key-mapping issue).
+
+  - id: TIMEOUT
+    title: Operation timed out
+    description: Discovery or pairing did not complete within the expected time window.
+    severity: error
+    suggested_actions:
+      - Check overall system performance and logcat for ANRs or long stalls.
+      - Retry the scenario and see if timing is consistently slow.
+      - If this is repeatable, capture a bugreport and assign to the Android/QuickSet performance owner.
+
+  - id: FALSE_POSITIVE
+    title: Suspected false positive
+    description: Logs show success but observed behavior contradicts it.
+    severity: warn
+    suggested_actions:
+      - Double-check that the tester observations are correct (TV OSD vs STB OSD).
+      - Rerun the scenario to see if the mismatch is reproducible.
+      - If reproducible, treat this as a product bug and file it with logs and bugreport.
+
+  - id: BEHAVIOR_MISMATCH
+    title: Behavior mismatch
+    description: Partial success; logs or UI indicate success but tester reports incorrect behavior.
+    severity: warn
+    suggested_actions:
+      - Validate that the test instructions were followed exactly.
+      - Capture a short video or photos of the UI and OSD behavior.
+      - Attach logs, bugreport and recordings to a product bug for further analysis.
+
+  - id: INCONCLUSIVE
+    title: Inconclusive result
+    description: Not enough evidence from logs or tester observations to decide pass/fail.
+    severity: warn
+    suggested_actions:
+      - Re-run the scenario and ensure the full flow is executed.
+      - Make sure logcat capture is running and tester answers all questions.
+      - If still inconclusive, consider extending log signatures or rules for this scenario.

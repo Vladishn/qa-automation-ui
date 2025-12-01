@@ -1,0 +1,30 @@
+# Node / frontend
+node_modules/
+dist/
+.cache/
+.vite/
+
+# Python / backend
+backend/.venv/
+__pycache__/
+*.pyc
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# MacOS
+.DS_Store
+
+# Logs / artifacts
+logs/
+artifacts/
+*.log
+
+# Env / secrets
+.env
+.env.*
+backend/.env
+src/.env
+

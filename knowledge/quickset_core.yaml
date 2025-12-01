@@ -1,0 +1,19 @@
+quickset_concepts:
+  - name: AutoSync
+    description: Automatic discovery of connected TV via HDMI and volume key mapping.
+  - name: PartnerRC
+    description: Android Remote & Accessories section where QuickSet pairing flows start.
+
+log_patterns:
+  success:
+    - "autoSyncState=SUCCESS"
+  failure:
+    - "autoSyncState=FAILED"
+    - "no_hdmi_device_found"
+    - "volumeMapError"
+    - "remoteModelNotFound"
+
+ui_expected_screens:
+  tv_auto_sync:
+    - "Scanning..."
+    - "Remote paired to your TV"

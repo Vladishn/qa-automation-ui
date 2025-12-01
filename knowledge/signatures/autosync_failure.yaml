@@ -1,0 +1,18 @@
+signatures:
+  - id: AUTOSYNC_SDK_CRASH
+    pattern: "Killing 2494:com.uei.quicksetsdk"
+    category: PAIRING_FAILED
+    severity: error
+    tags: [autosync, service]
+
+  - id: AUTOSYNC_SERVICE_DISCONNECTED
+    pattern: "QuickSet: IControl service disconnected"
+    category: PAIRING_FAILED
+    severity: error
+    tags: [autosync, service]
+
+  - id: AUTOSYNC_SERVICE_NOT_READY
+    pattern: "Unable to call QuickSet, instance not ready!"
+    category: PAIRING_FAILED
+    severity: error
+    tags: [autosync, service]

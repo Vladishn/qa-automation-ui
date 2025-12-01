@@ -1,0 +1,63 @@
+states:
+  - id: START
+    description: Flow initialized and QuickSet AutoSync launched.
+    expected_signals: []
+  - id: SCANNING
+    description: Device scanning for HDMI/CEC TV.
+    expected_signals:
+      - autosync_scan_start
+  - id: BRAND_FOUND
+    description: TV brand detected.
+    expected_signals:
+      - autosync_tv_brand_detected
+  - id: PAIRING
+    description: Applying mapping/pairing to TV.
+    expected_signals:
+      - autosync_pairing_start
+  - id: SUCCESS
+    description: AutoSync completed successfully.
+    expected_signals:
+      - autosync_success
+    terminal: true
+  - id: FAILURE
+    description: AutoSync failed.
+    expected_signals:
+      - autosync_failed
+      - autosync_no_hdmi
+    terminal: true
+  - id: INCONCLUSIVE
+    description: No decisive evidence of success or failure.
+    expected_signals: []
+    terminal: true
+
+transitions:
+  - from: START
+    to: SCANNING
+    on_signals: [autosync_scan_start]
+  - from: SCANNING
+    to: BRAND_FOUND
+    on_signals: [autosync_tv_brand_detected]
+  - from: SCANNING
+    to: FAILURE
+    on_signals: [autosync_no_hdmi, autosync_failed]
+  - from: BRAND_FOUND
+    to: PAIRING
+    on_signals: [autosync_pairing_start]
+  - from: PAIRING
+    to: SUCCESS
+    on_signals: [autosync_success]
+  - from: PAIRING
+    to: FAILURE
+    on_signals: [autosync_failed]
+  - from: START
+    to: INCONCLUSIVE
+    on_timeout: true
+  - from: SCANNING
+    to: INCONCLUSIVE
+    on_timeout: true
+  - from: BRAND_FOUND
+    to: INCONCLUSIVE
+    on_timeout: true
+  - from: PAIRING
+    to: INCONCLUSIVE
+    on_timeout: true

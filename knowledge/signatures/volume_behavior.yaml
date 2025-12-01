@@ -1,0 +1,37 @@
+# File: knowledge/signatures/volume_behavior.yaml
+signatures:
+  - id: VOLUME_SOURCE_JSON_0
+    pattern: "\"volume_source\":0"
+    category: VOLUME_SOURCE_0
+    severity: info
+    tags: [volume_probe, json]
+
+  - id: VOLUME_SOURCE_JSON_1
+    pattern: "\"volume_source\":1"
+    category: VOLUME_SOURCE_1
+    severity: info
+    tags: [volume_probe, json]
+
+  - id: VOLUME_SOURCE_CUR_0
+    pattern: "curVolSource: 0"
+    category: VOLUME_SOURCE_0
+    severity: info
+    tags: [volume_probe, event]
+
+  - id: VOLUME_SOURCE_CUR_1
+    pattern: "curVolSource: 1"
+    category: VOLUME_SOURCE_1
+    severity: info
+    tags: [volume_probe, event]
+
+  - id: VOLUME_SOURCE_SETTING_0
+    pattern: "current_volume_source.*value:0"
+    category: VOLUME_SOURCE_0
+    severity: info
+    tags: [volume_probe, settings]
+
+  - id: VOLUME_SOURCE_SETTING_1
+    pattern: "current_volume_source.*value:1"
+    category: VOLUME_SOURCE_1
+    severity: info
+    tags: [volume_probe, settings]

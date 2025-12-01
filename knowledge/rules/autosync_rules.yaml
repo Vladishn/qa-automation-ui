@@ -1,0 +1,106 @@
+# File: knowledge/rules/autosync_rules.yaml
+rules:
+  - id: fail_sdk_crash
+    description: QuickSet SDK crashed during AutoSync.
+    conditions:
+      required_signals: [AUTOSYNC_SDK_CRASH]
+    outcome:
+      status: FAIL
+      root_cause_category: PAIRING_FAILED
+      analysis: QuickSet SDK crashed; AutoSync considered failed.
+      suggested_actions:
+        - "Reboot the STB and retry the Auto Sync flow."
+        - "Collect a full bugreport immediately after the crash and attach to the ticket."
+
+  - id: fail_service_not_ready
+    description: QuickSet service not ready during AutoSync.
+    conditions:
+      required_signals: [AUTOSYNC_SERVICE_NOT_READY]
+    outcome:
+      status: FAIL
+      root_cause_category: PAIRING_FAILED
+      analysis: QuickSet service was not ready; AutoSync cannot continue.
+      suggested_actions:
+        - "Restart the PartnerRC/QuickSet application and rerun the test."
+        - "Verify the QuickSet SDK package is installed and not frozen by the OS."
+
+  - id: pass_with_probe_tv_volume
+    description: AutoSync success with probe confirming TV volume control.
+    conditions:
+      required_signals: [AUTOSYNC_SUCCESS]
+      probe:
+        volume_source: TV
+    outcome:
+      status: PASS
+      root_cause_category: SUCCESS
+      analysis: AutoSync succeeded and the probe confirmed TV volume mapping.
+      suggested_actions:
+        - "Optionally rerun Auto Sync on another HDMI input to double-check stability."
+
+  - id: fail_volume_mapping_by_probe
+    description: AutoSync success but probe shows STB volume.
+    conditions:
+      required_signals: [AUTOSYNC_SUCCESS]
+      probe:
+        volume_source: STB
+    outcome:
+      status: FAIL
+      root_cause_category: VOLUME_MAPPING_FAILED
+      analysis: AutoSync reported success but only the STB volume reacted during the probe.
+      suggested_actions:
+        - "Run the probe again while recording the TV screen to capture the incorrect OSD."
+        - "Verify that the TV supports HDMI-CEC and that CEC is enabled in TV settings."
+
+  - id: pass_with_observed_behavior
+    description: Success signals present and tester confirms correct TV behavior.
+    conditions:
+      required_signals: [AUTOSYNC_SUCCESS]
+      tester:
+        tv_volume_changed: true
+        tv_osd_seen: true
+    outcome:
+      status: PASS
+      root_cause_category: SUCCESS
+      analysis: Logs show AutoSync success; tester confirms TV volume and OSD are correct.
+      suggested_actions:
+        - "Document the pass result and proceed to the next scenario."
+
+  - id: fail_no_hdmi
+    description: HDMI discovery failed and tester saw no TV OSD.
+    conditions:
+      required_signals: [AUTOSYNC_NO_HDMI]
+      tester:
+        tv_osd_seen: false
+    outcome:
+      status: FAIL
+      root_cause_category: NO_HDMI_DEVICE_FOUND
+      analysis: AutoSync failed to detect TV over HDMI; tester confirms no TV OSD.
+      suggested_actions:
+        - "Double-check HDMI cabling and that the TV is on the correct input."
+        - "Collect 'adb shell dumpsys hdmi_control' and attach it with the logs."
+
+  - id: fail_behavior_mismatch
+    description: Logs show success but tester reports incorrect behavior.
+    conditions:
+      required_signals: [AUTOSYNC_SUCCESS]
+      tester_any:
+        tv_volume_changed: [false]
+        tv_osd_seen: [false]
+    outcome:
+      status: FAIL
+      root_cause_category: BEHAVIOR_MISMATCH
+      analysis: Logs show success but observed behavior does not match TV volume/OSD expectations.
+      suggested_actions:
+        - "Rerun the scenario and capture a short video of the incorrect behavior."
+        - "Attach logcat + video evidence and assign to the QuickSet feature owner."
+
+  - id: inconclusive_default
+    description: No decisive evidence.
+    conditions: {}
+    outcome:
+      status: INCONCLUSIVE
+      root_cause_category: INCONCLUSIVE
+      analysis: Not enough evidence from logs, probe, or tester observations to decide.
+      suggested_actions:
+        - "Rerun the scenario ensuring logcat capture and all tester questions are answered."
+        - "If still inconclusive, enrich the knowledge layer or escalate to engineering."

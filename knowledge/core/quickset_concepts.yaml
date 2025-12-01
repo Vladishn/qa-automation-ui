@@ -1,0 +1,38 @@
+entities:
+  - id: STB
+    description: >
+      The set-top box (SEI STB) running Android TV with QuickSet/PartnerRC.
+      Must be reachable over ADB for automation and log collection.
+  - id: TV
+    description: >
+      External television connected over HDMI/CEC. Brand/model discovered by QuickSet.
+      Expected to show TV-native OSD when volume keys are mapped correctly.
+  - id: Remote
+    description: >
+      The physical remote controlling the STB and (after mapping) the TV volume.
+      Supports pairing/mapping flows driven by QuickSet.
+  - id: QuickSetEngine
+    description: >
+      QuickSet stack on the STB handling discovery, brand detection, pairing, and key mapping
+      (including AutoSync and volume mapping).
+
+behaviors:
+  - id: AutoSync
+    description: >
+      Automated discovery of connected TV over HDMI/CEC, brand detection, and remote mapping
+      without user entering brand codes. Terminal outcomes: success, failure, or inconclusive.
+  - id: VolumeMapping
+    description: >
+      Mapping volume keys to TV instead of STB. Verified via TV OSD/volume change observations
+      plus matching log evidence.
+  - id: Discovery
+    description: >
+      HDMI/CEC discovery of connected TV, brand identification, and capability detection.
+      Prerequisite for AutoSync.
+
+preconditions:
+  - ADB is reachable for the STB (adb connect works).
+  - TV is powered on and connected over HDMI/CEC.
+  - QuickSet/PartnerRC components are present and launchable on the STB.
+  - Log capture is functioning (logcat accessible).
+  - Remote battery level sufficient (implicit; not measured yet).

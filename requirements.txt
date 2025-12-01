@@ -1,0 +1,5 @@
+# Runtime and tooling dependencies for the QA automation project.
+typer==0.12.5
+rich==13.7.1
+PyYAML==6.0.2
+pytest==8.3.2

@@ -1,0 +1,24 @@
+tv_auto_sync_flow:
+  - id: SCAN_START
+    expected_log: "Starting AutoSync"
+    description: Initial trigger from UI.
+
+  - id: SCANNING
+    expected_log: "QuickSet scanning HDMI devices"
+    expected_ui: "Scanning..."
+
+  - id: BRAND_DETECTED
+    expected_log: "tvBrandName="
+    expected_ui: "We found Samsung"
+
+  - id: PAIRING
+    expected_log: "Pairing remote"
+    expected_ui: "Pairing..."
+
+  - id: SUCCESS
+    expected_log: "autoSyncState=SUCCESS"
+    expected_ui: "Remote paired to your TV"
+
+  - id: FAILURE
+    expected_log: "autoSyncState=FAILED"
+    expected_ui: "Pairing failed"

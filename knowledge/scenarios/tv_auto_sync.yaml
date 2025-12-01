@@ -1,0 +1,40 @@
+scenario_id: TV_AUTO_SYNC
+title: QuickSet TV Auto Sync
+description: >
+  Verify that QuickSet automatically discovers the connected TV, detects its brand,
+  and maps remote volume keys to control the TV (not the STB).
+preconditions:
+  - ADB reachable to the STB
+  - TV powered on and connected via HDMI/CEC
+  - PartnerRC/QuickSet is available and launchable
+expected_behaviors:
+  tv_volume_changes: true
+  tv_osd_shown: true
+  remote_controls_tv_volume_not_stb: true
+tester_questions:
+  - id: tv_volume_changed
+    type: yes_no
+    text: Did the TV volume change (not the STB volume)?
+  - id: tv_osd_seen
+    type: yes_no
+    text: Did you see the TV's volume OSD (not the STB's)?
+  - id: pairing_screen_seen
+    type: yes_no
+    text: Did you see a screen indicating the remote was paired to the TV?
+  - id: tv_brand_ui
+    type: text
+    text: Which TV brand name did you see on the on-screen pairing/summary screen?
+  - id: notes
+    type: text
+    text: Any additional observations to record?
+required_log_signatures:
+  - autosync_success
+  - autosync_tv_brand_detected
+failure_categories:
+  - NO_HDMI_DEVICE_FOUND
+  - BRAND_DETECTION_FAILED
+  - PAIRING_FAILED
+  - BEHAVIOR_MISMATCH
+timeouts:
+  discovery_seconds: 30
+  pairing_seconds: 30

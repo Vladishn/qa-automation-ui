@@ -1,0 +1,42 @@
+scenario_id: TV_AUTO_SYNC
+title: "QuickSet TV Auto Sync"
+description: >
+  Verify that QuickSet automatically discovers the connected TV and maps
+  the remote's volume keys to control the TV volume (not the STB's volume).
+
+preconditions:
+  - "STB is powered on and reachable over ADB."
+  - "PartnerRC appears in Android TV settings."
+  - "TV is connected via HDMI and powered on."
+
+expected_outcomes:
+  ui:
+    - "A scan screen appears indicating device scanning."
+    - "At the end, a screen appears saying that the remote is paired to the TV."
+  behavior:
+    - "Volume buttons change the TV volume, not the STB volume."
+    - "The on-screen volume indicator (OSD) is from the TV, not from the STB."
+  logs:
+    required_tags:
+      - "QuickSet"
+      - "AutoSync"
+    success_patterns:
+      - "autoSyncState=SUCCESS"
+      - "tvBrandName="
+    failure_patterns:
+      - "autoSyncState=FAILED"
+      - "no_hdmi_device_found"
+
+questions_for_tester:
+  - id: tv_volume_changed
+    text: "האם עוצמת הווליום של הטלוויזיה השתנתה (ולא של הממיר)?"
+    type: yes_no
+  - id: tv_osd_seen
+    text: "האם ה-OSD שהופיע היה של הטלוויזיה ולא של הממיר?"
+    type: yes_no
+  - id: pairing_screen_seen
+    text: "האם ראית מסך שמודיע שהשלט הותאם לטלוויזיה?"
+    type: yes_no
+  - id: notes
+    text: "האם יש תצפיות נוספות שחשוב לתעד (טקסט חופשי)?"
+    type: text
