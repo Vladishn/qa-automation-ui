@@ -5,13 +5,15 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from ..models import QuickSetQuestion, QuickSetSession, QuickSetStep
+from ..adb_service import AdbPrecheckResult, AdbPrecheckStatus, precheck
+from ..models import QuickSetInfraCheck, QuickSetQuestion, QuickSetSession, QuickSetStep
 from ..storage import quickset_session_store
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -98,7 +100,7 @@ def get_session(
     session = quickset_session_store.get_session(session_id)
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-    return session
+    return compute_session_decision(session)
 
 
 @router.post("/sessions/{session_id}/answer", response_model=QuickSetSession)
@@ -115,7 +117,7 @@ def answer_question(
 
     quickset_session_store.deliver_answer(session_id, payload.answer)
     updated = quickset_session_store.get_session(session_id)
-    return updated if updated else session
+    return compute_session_decision(updated if updated else session)
 
 
 def ask_via_session(
@@ -184,13 +186,13 @@ def _make_ask(session_id: str, step_logger: QuickSetStepLogger):
         step_logger.log_step(
             f"question_{question_id}",
             "INFO",
-            {"prompt": prompt_text, "question_id": question_id},
+            {"prompt": prompt_text, "question_id": question_id, "tester_visible": True},
         )
         answer = ask_via_session(session_id, question_id, prompt_text, {"question_id": question_id})
         step_logger.log_step(
             f"question_{question_id}_answer",
             "INFO",
-            {"prompt": prompt_text, "answer": answer, "question_id": question_id},
+            {"prompt": prompt_text, "answer": answer, "question_id": question_id, "tester_visible": True},
         )
         return answer
 
@@ -202,6 +204,10 @@ def _execute_tv_auto_sync(session_id: str, tester_id: str, stb_ip: str) -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
     step_logger = QuickSetStepLogger(session_id=session_id, output_dir=STEP_LOG_DIR)
     quickset_session_store.set_state(session_id, "running")
+
+    precheck_result = _run_adb_precheck(session_id, step_logger, stb_ip)
+    if precheck_result.status is not AdbPrecheckStatus.OK:
+        return
 
     logcat_path = raw_dir / f"{session_id}_tv_auto_sync.log"
     final_status = "fail"
@@ -231,6 +237,14 @@ def _execute_tv_auto_sync(session_id: str, tester_id: str, stb_ip: str) -> None:
     adb_log = _read_text(step_logger.log_path)
     logcat_log = _read_text(logcat_path)
 
+    tv_model = _extract_tv_model_from_text(logcat_log)
+    if tv_model:
+        quickset_session_store.set_tv_model(session_id, tv_model)
+
+    remote_keys = _extract_remote_keys(logcat_log)
+    if remote_keys:
+        quickset_session_store.set_remote_keys(session_id, remote_keys)
+
     snapshot = quickset_session_store.get_session(session_id)
     if snapshot:
         for step in reversed(snapshot.steps):
@@ -258,3 +272,285 @@ def _read_text(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _split_target(raw: str) -> tuple[str, int]:
+    if ":" in raw:
+        host, port_str = raw.rsplit(":", 1)
+        try:
+            return host, int(port_str)
+        except ValueError:
+            return host, 5555
+    return raw, 5555
+
+
+def _run_adb_precheck(session_id: str, step_logger: QuickSetStepLogger, raw_target: str) -> AdbPrecheckResult:
+    host, port = _split_target(raw_target)
+    result = precheck(host, port)
+    metadata = {
+        "status": result.status.value,
+        "message": result.message,
+        "ping_ok": result.ping_ok,
+        "tcp_port_open": result.tcp_port_open,
+        "adb_stdout": result.adb_stdout,
+        "adb_stderr": result.adb_stderr,
+        "tester_visible": False,
+    }
+
+    infra_status = "ok" if result.status is AdbPrecheckStatus.OK else "fail"
+    quickset_session_store.add_infra_check(
+        session_id,
+        QuickSetInfraCheck(name="adb_precheck", status=infra_status, message=result.message),
+    )
+
+    if result.status is AdbPrecheckStatus.OK:
+        step_logger.log_step("adb_precheck", "PASS", metadata)
+        return result
+
+    step_logger.log_step("adb_precheck", "FAIL", metadata)
+    quickset_session_store.finalize_session(
+        session_id,
+        result="fail",
+        logs={"adb": "", "logcat": ""},
+        summary=result.message,
+    )
+    return result
+
+
+TV_BRAND_MODEL_PATTERNS = [
+    re.compile(r"brand\s*[:=]\s*(?P<brand>[A-Za-z0-9 _-]+).*model\s*[:=]\s*(?P<model>[A-Za-z0-9 _-]+)", re.IGNORECASE),
+    re.compile(r"tv[_ ]?model(?:name)?\s*[:=\-]\s*(?P<model>[A-Za-z0-9 _-]+)", re.IGNORECASE),
+    re.compile(r"modelName\s*=\s*(?P<model>[A-Za-z0-9 _-]+)", re.IGNORECASE),
+]
+
+REMOTE_KEY_PATTERNS = [
+    re.compile(r"KEYCODE_[A-Z0-9_]+"),
+    re.compile(r"keycode\s+([A-Z0-9_]+)", re.IGNORECASE),
+]
+
+
+def _extract_tv_model_from_text(log_text: str) -> Optional[str]:
+    if not log_text:
+        return None
+    for pattern in TV_BRAND_MODEL_PATTERNS:
+        match = pattern.search(log_text)
+        if match:
+            brand = match.groupdict().get("brand")
+            model = match.groupdict().get("model")
+            if brand and model:
+                return f"{brand.strip()} {model.strip()}".strip()
+            if model:
+                return model.strip()
+    return None
+
+
+def _extract_remote_keys(log_text: str) -> List[str]:
+    if not log_text:
+        return []
+    seen: set[str] = set()
+    detected: List[str] = []
+    upper_text = log_text.upper()
+    for pattern in REMOTE_KEY_PATTERNS:
+        for match in pattern.finditer(upper_text):
+            key = match.group(1) if match.lastindex else match.group(0)
+            if not key:
+                continue
+            cleaned = key.upper().strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                detected.append(cleaned)
+    return detected
+
+
+def compute_session_decision(session: QuickSetSession) -> QuickSetSession:
+    if session.state != "completed":
+        return session
+
+    has_log_analysis = any(step.name == "log_analysis_complete" for step in session.steps)
+    if not has_log_analysis:
+        return session
+
+    log_meta = _extract_latest_metadata(session.steps, "log_analysis_complete")
+    log_state = None
+    terminal_state = None
+    if isinstance(log_meta, dict):
+        potential_state = log_meta.get("state")
+        if isinstance(potential_state, dict):
+            log_state = potential_state
+            term = potential_state.get("terminal_state")
+            if isinstance(term, str):
+                terminal_state = term
+
+    tester_meta = _extract_latest_metadata(session.steps, "tester_questions")
+    observations: Optional[dict] = None
+    if isinstance(tester_meta, dict):
+        obs = tester_meta.get("observations") or tester_meta
+        if isinstance(obs, dict):
+            observations = obs
+
+    probe_meta = _extract_latest_metadata(session.steps, "volume_probe_result")
+    tv_meta = _extract_latest_metadata(session.steps, "tv_metadata")
+
+    result, summary = compute_quickset_result(
+        terminal_state,
+        log_state,
+        observations,
+        probe_meta,
+        tv_meta,
+    )
+    final_summary = summary or ""
+    if session.tv_model and session.tv_model not in final_summary:
+        suffix = f"TV model detected: {session.tv_model}."
+        final_summary = f"{final_summary} {suffix}".strip()
+
+    updated_steps: List[QuickSetStep] = []
+    last_summary_idx: Optional[int] = None
+    for idx, step in enumerate(session.steps):
+        updated_steps.append(step)
+        if step.name == "analysis_summary":
+            last_summary_idx = idx
+
+    if last_summary_idx is not None:
+        step = updated_steps[last_summary_idx]
+        metadata = dict(step.metadata or {})
+        metadata["analysis"] = final_summary or result.upper()
+        updated_steps[last_summary_idx] = step.model_copy(update={"metadata": metadata})
+
+    return session.model_copy(update={"result": result, "summary": final_summary, "steps": updated_steps})
+
+
+def _extract_latest_metadata(steps: List[QuickSetStep], step_name: str) -> Optional[dict]:
+    for step in reversed(steps):
+        if step.name == step_name and isinstance(step.metadata, dict):
+            return step.metadata
+    return None
+
+
+def _normalize_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"yes", "y", "true", "1", "on"}:
+            return True
+        if normalized in {"no", "n", "false", "0", "off"}:
+            return False
+    return None
+
+
+def _clean_str(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compute_quickset_result(
+    log_terminal_state: Optional[str],
+    log_state: Optional[dict],
+    observations: Optional[dict],
+    volume_probe: Optional[dict],
+    tv_metadata: Optional[dict],
+) -> Tuple[str, str]:
+    terminal = (log_terminal_state or "").upper()
+    tv_volume_changed = _normalize_bool((observations or {}).get("tv_volume_changed"))
+    tv_osd_seen = _normalize_bool((observations or {}).get("tv_osd_seen"))
+    pairing_screen_seen = _normalize_bool((observations or {}).get("pairing_screen_seen"))
+    tv_brand_ui = _clean_str((observations or {}).get("tv_brand_ui"))
+    tester_brand = _clean_str((observations or {}).get("tester_brand"))
+    notes = _clean_str((observations or {}).get("notes"))
+
+    probe_source = _clean_str((volume_probe or {}).get("volume_source"))
+    probe_source_upper = (probe_source or "").upper()
+    probe_confidence = _safe_float((volume_probe or {}).get("confidence"))
+
+    tv_brand_logs = _clean_str((tv_metadata or {}).get("tv_brand_logs"))
+    tv_model_logs = _clean_str((tv_metadata or {}).get("tv_model_logs"))
+
+    def _failure_summary() -> str:
+        reasons: List[str] = []
+        if isinstance(log_state, dict):
+            failures = log_state.get("matched_failure") or log_state.get("matched_failures")
+            if isinstance(failures, list):
+                reasons = [str(item) for item in failures if item]
+        if reasons:
+            return f"TV_AUTO_SYNC failed: {', '.join(reasons)}."
+        return "TV_AUTO_SYNC failed: QuickSet logs reported a failure state."
+
+    if terminal == "FAILURE":
+        summary = _failure_summary()
+        summary = _append_brand_line(summary, tv_brand_ui, tv_brand_logs, tester_brand, tv_model_logs)
+        return "fail", summary
+
+    pass_conditions = all(flag is True for flag in (tv_volume_changed, tv_osd_seen, pairing_screen_seen))
+    probe_tv = probe_source_upper == "TV" and probe_confidence >= 0.7
+
+    if terminal == "SUCCESS" and probe_tv and pass_conditions:
+        summary = (
+            "TV_AUTO_SYNC succeeded: logs show a full scan/pairing sequence,"
+            " volume probe detected control on the TV, and the tester confirmed TV volume, TV OSD,"
+            " and the pairing screen."
+        )
+        if tv_brand_ui and tv_brand_logs and tv_brand_ui.lower() != tv_brand_logs.lower():
+            summary += f" Note: UI brand '{tv_brand_ui}' does not match logs brand '{tv_brand_logs}'."
+        elif tv_brand_ui:
+            summary += f" Detected TV brand: {tv_brand_ui}."
+        elif tv_brand_logs:
+            summary += f" Detected TV brand from logs: {tv_brand_logs}."
+        if notes:
+            summary += f" Tester notes: {notes}."
+        summary = _append_brand_line(summary, tv_brand_ui, tv_brand_logs, tester_brand, tv_model_logs)
+        return "pass", summary
+
+    # Probe disagrees while tester reported positives
+    tester_positive = any(flag is True for flag in (tv_volume_changed, tv_osd_seen, pairing_screen_seen))
+    if probe_source_upper and probe_source_upper != "TV" and probe_confidence >= 0.7 and tester_positive:
+        summary = (
+            "TV_AUTO_SYNC failed: volume probe indicates control remained on the "
+            f"{probe_source_upper} despite positive tester observations."
+        )
+        summary = _append_brand_line(summary, tv_brand_ui, tv_brand_logs, tester_brand, tv_model_logs)
+        return "fail", summary
+
+    if terminal == "SUCCESS":
+        summary = (
+            "QuickSet logs reported a successful sequence, but tester observations or probe results were"
+            " insufficient to confirm TV control."
+        )
+        summary = _append_brand_line(summary, tv_brand_ui, tv_brand_logs, tester_brand, tv_model_logs)
+        return "inconclusive", summary
+
+    summary = (
+        "Not enough evidence from logs, probe, or tester observations to decide."
+        " Please review the captured logs and observations manually."
+    )
+    summary = _append_brand_line(summary, tv_brand_ui, tv_brand_logs, tester_brand, tv_model_logs)
+    return "inconclusive", summary
+
+
+def _append_brand_line(
+    summary: str,
+    ui_brand: Optional[str],
+    logs_brand: Optional[str],
+    tester_brand: Optional[str],
+    logs_model: Optional[str],
+) -> str:
+    ui_value = ui_brand or "N/A"
+    logs_value = logs_brand or logs_model or "N/A"
+    tester_value = tester_brand or "N/A"
+    brand_line = (
+        f"TV brand/model: UI='{ui_value}' • Logs='{logs_value}' • Tester='{tester_value}'."
+    )
+    summary = f"{summary} {brand_line}".strip()
+    if ui_brand and logs_brand and ui_brand.lower() != logs_brand.lower():
+        summary = f"{summary} Note: brand mismatch (UI vs Logs)."
+    return summary

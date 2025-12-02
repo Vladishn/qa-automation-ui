@@ -96,7 +96,7 @@ export interface ManagementKpi {
   mediumBugs: number;
 }
 
-export type QuickSetStepStatus = 'pending' | 'running' | 'pass' | 'fail' | 'info';
+export type QuickSetStepStatus = 'pending' | 'running' | 'pass' | 'fail' | 'inconclusive' | 'info';
 
 export interface QuickSetStep {
   name: string;
@@ -116,6 +116,12 @@ export interface QuickSetQuestion {
   metadata: Record<string, any>;
 }
 
+export interface QuickSetInfraCheck {
+  name: string;
+  status: 'ok' | 'fail' | 'skip';
+  message: string;
+}
+
 export interface QuickSetSession {
   session_id: string;
   tester_id: string;
@@ -132,4 +138,7 @@ export interface QuickSetSession {
   state?: 'running' | 'awaiting_input' | 'completed' | 'failed';
   pending_question?: QuickSetQuestion | null;
   summary?: string | null;
+  tv_model?: string | null;
+  remote_keys?: string[];
+  infra_checks?: QuickSetInfraCheck[];
 }

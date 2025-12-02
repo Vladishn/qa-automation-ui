@@ -17,6 +17,18 @@ const formatDateTime = (value?: string | null): string => {
   return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
 };
 
+const formatLogPreview = (value?: string | null, maxLines = 500): string => {
+  if (!value) return 'No logs yet.';
+  const lines = value.split(/\r?\n/);
+  if (lines.length <= maxLines) {
+    return value;
+  }
+  return [
+    `Showing last ${maxLines} lines of ${lines.length} total.`,
+    ...lines.slice(-maxLines)
+  ].join('\n');
+};
+
 const getStepInfo = (step: QuickSetStep): string => {
   const metadata = (step.metadata ?? {}) as Record<string, unknown>;
   const fields = ['analysis', 'message', 'prompt', 'instruction', 'instructions', 'info'];
@@ -38,8 +50,16 @@ const getStatusClass = (label: string): string => {
   if (normalized === 'FAIL') return 'status-pill status-pill--fail';
   if (normalized === 'RUNNING') return 'status-pill status-pill--running';
   if (normalized === 'AWAITING INPUT') return 'status-pill status-pill--running';
+  if (normalized === 'INCONCLUSIVE') return 'status-pill status-pill--info';
   if (normalized === 'INFO') return 'status-pill status-pill--info';
   return 'status-pill';
+};
+
+const getInfraStatusClass = (status: string): string => {
+  const normalized = status.toUpperCase();
+  if (normalized === 'OK') return 'status-pill status-pill--pass';
+  if (normalized === 'FAIL') return 'status-pill status-pill--fail';
+  return 'status-pill status-pill--info';
 };
 
 const getDisplayStatus = (step: QuickSetStep, session: QuickSetSession | null): string => {
@@ -186,6 +206,25 @@ const QuickSetRunner: React.FC = () => {
   }, [session, sessionId]);
 
   const steps: QuickSetStep[] = session?.steps ?? [];
+
+  const shouldDisplayStep = (step: QuickSetStep): boolean => {
+    const metadata = (step.metadata ?? {}) as Record<string, any>;
+    if (metadata?.tester_visible === false) {
+      return false;
+    }
+    if (step.status === 'INFO') {
+      if (metadata?.prompt || metadata?.analysis || metadata?.message) {
+        return true;
+      }
+      if (step.name.startsWith('question_')) {
+        return true;
+      }
+      return false;
+    }
+    return true;
+  };
+
+  const visibleSteps = steps.filter(shouldDisplayStep);
 
   const submitAnswer = async (value: string) => {
     if (!sessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {
@@ -361,7 +400,9 @@ const QuickSetRunner: React.FC = () => {
                 {resultLabel}
               </span>
             </p>
-            <p className="hint">Summary: {session?.summary || '—'}</p>
+            <div className="hint" style={{ fontWeight: 600, marginTop: 8 }}>Summary</div>
+            <div className="hint" style={{ whiteSpace: 'pre-wrap' }}>{session?.summary || '—'}</div>
+            <p className="hint">TV Model: {session?.tv_model || '—'}</p>
             <p className="hint">Started: {formatDateTime(session?.start_time)}</p>
             <p className="hint">Finished: {formatDateTime(session?.end_time)}</p>
           </div>
@@ -370,9 +411,35 @@ const QuickSetRunner: React.FC = () => {
         )}
       </div>
 
+      {session?.infra_checks && session.infra_checks.length > 0 && (
+        <div className="card" style={{ marginBottom: 24 }}>
+          <h3>Infra Checks</h3>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Status</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {session.infra_checks.map((check) => (
+                <tr key={check.name}>
+                  <td>{check.name}</td>
+                  <td>
+                    <span className={getInfraStatusClass(check.status)}>{check.status.toUpperCase()}</span>
+                  </td>
+                  <td>{check.message}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="card" style={{ marginBottom: 24 }}>
         <h3>Steps Timeline</h3>
-        {steps.length === 0 ? (
+        {visibleSteps.length === 0 ? (
           <p className="hint">Steps will appear once the run starts.</p>
         ) : (
           <table className="table">
@@ -385,7 +452,7 @@ const QuickSetRunner: React.FC = () => {
               </tr>
             </thead>
             <tbody>
-              {steps.map((step) => {
+              {visibleSteps.map((step) => {
                 const displayStatus = getDisplayStatus(step, session);
                 return (
                   <tr key={`${step.name}-${step.timestamp ?? ''}`}>
@@ -405,12 +472,12 @@ const QuickSetRunner: React.FC = () => {
 
       <div className="card" style={{ marginBottom: 24 }}>
         <h3>ADB Logs</h3>
-        <pre className="log-block">{session?.logs?.adb ?? 'No logs yet.'}</pre>
+        <pre className="log-block log-panel-content">{formatLogPreview(session?.logs?.adb)}</pre>
       </div>
 
       <div className="card">
         <h3>Logcat Logs</h3>
-        <pre className="log-block">{session?.logs?.logcat ?? 'No logs yet.'}</pre>
+        <pre className="log-block log-panel-content">{formatLogPreview(session?.logs?.logcat)}</pre>
       </div>
     </section>
   );

@@ -279,6 +279,12 @@ body {
   font-size: 12px;
 }
 
+.log-panel-content {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 /* Shared page layout */
 .page {
   display: flex;

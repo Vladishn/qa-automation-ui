@@ -12,6 +12,7 @@ from .models import (
     Channel,
     DomainType,
     PlatformModel,
+    QuickSetInfraCheck,
     QuickSetQuestion,
     QuickSetSession,
     QuickSetStep,
@@ -307,20 +308,52 @@ class QuickSetSessionStore:
             updated = session.model_copy(update={"logs": new_logs})
             self._save(session_id, updated)
 
-    def finalize_session(self, session_id: str, result: str, logs: Dict[str, str]) -> None:
+    def finalize_session(self, session_id: str, result: str, logs: Dict[str, str], summary: Optional[str] = None) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
             if not session:
                 return
-            updated = session.model_copy(
-                update={
-                    "result": result,
-                    "end_time": datetime.utcnow(),
-                    "logs": {**session.logs, **logs},
-                    "state": "completed",
-                    "pending_question": None,
-                }
-            )
+            update_payload = {
+                "result": result,
+                "end_time": datetime.utcnow(),
+                "logs": {**session.logs, **logs},
+                "state": "completed",
+                "pending_question": None,
+            }
+            if summary:
+                update_payload["summary"] = summary
+            updated = session.model_copy(update=update_payload)
+            self._save(session_id, updated)
+
+    def set_tv_model(self, session_id: str, tv_model: Optional[str]) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            updated = session.model_copy(update={"tv_model": tv_model})
+            self._save(session_id, updated)
+
+    def set_remote_keys(self, session_id: str, keys: List[str]) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            updated = session.model_copy(update={"remote_keys": keys})
+            self._save(session_id, updated)
+
+    def add_infra_check(self, session_id: str, check: QuickSetInfraCheck) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            checks = list(session.infra_checks)
+            for idx, existing in enumerate(checks):
+                if existing.name == check.name:
+                    checks[idx] = check
+                    break
+            else:
+                checks.append(check)
+            updated = session.model_copy(update={"infra_checks": checks})
             self._save(session_id, updated)
 
     def set_pending_question(self, session_id: str, question: QuickSetQuestion) -> None:

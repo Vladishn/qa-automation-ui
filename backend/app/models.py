@@ -84,8 +84,9 @@ class SessionModel:
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
 
-QuickSetStatus = Literal["pending", "running", "pass", "fail", "info"]
+QuickSetStatus = Literal["pending", "running", "pass", "fail", "inconclusive", "info"]
 QuickSetInputKind = Literal["continue", "boolean", "text"]
+QuickSetInfraStatus = Literal["ok", "fail", "skip"]
 
 
 class QuickSetStep(BaseModel):
@@ -104,6 +105,12 @@ class QuickSetQuestion(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class QuickSetInfraCheck(BaseModel):
+    name: str
+    status: QuickSetInfraStatus
+    message: str
+
+
 class QuickSetSession(BaseModel):
     session_id: str
     tester_id: str
@@ -117,3 +124,6 @@ class QuickSetSession(BaseModel):
     state: str = "running"
     pending_question: Optional[QuickSetQuestion] = None
     summary: Optional[str] = None
+    tv_model: Optional[str] = None
+    remote_keys: List[str] = Field(default_factory=list)
+    infra_checks: List[QuickSetInfraCheck] = Field(default_factory=list)
