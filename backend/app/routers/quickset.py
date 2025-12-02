@@ -13,7 +13,12 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from pydantic import BaseModel, Field
 
 from ..adb_service import AdbPrecheckResult, AdbPrecheckStatus, precheck
-from ..models import QuickSetInfraCheck, QuickSetQuestion, QuickSetSession, QuickSetStep
+from ..models import (
+    QuickSetInfraCheck,
+    QuickSetQuestion,
+    QuickSetSession,
+    QuickSetStep,
+)
 from ..storage import quickset_session_store
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -246,25 +251,19 @@ def _execute_tv_auto_sync(session_id: str, tester_id: str, stb_ip: str) -> None:
         quickset_session_store.set_remote_keys(session_id, remote_keys)
 
     snapshot = quickset_session_store.get_session(session_id)
+    final_summary = ""
     if snapshot:
-        for step in reversed(snapshot.steps):
-            if step.name == "analysis_summary":
-                quickset_session_store.replace_step(
-                    session_id,
-                    "analysis_summary",
-                    QuickSetStep(
-                        name="analysis_summary",
-                        status=final_status,
-                        timestamp=step.timestamp or datetime.utcnow(),
-                        metadata=step.metadata,
-                    ),
-                )
-                break
+        evidence = _collect_session_evidence(snapshot)
+        decision_result, decision_summary = compute_quickset_result(*evidence)
+        final_status = decision_result
+        final_summary = decision_summary
+        _sync_analysis_summary_step(session_id, snapshot.steps, final_status, final_summary)
 
     quickset_session_store.finalize_session(
         session_id,
         result=final_status,
         logs={"adb": adb_log, "logcat": logcat_log},
+        summary=final_summary or None,
     )
 
 
@@ -370,6 +369,32 @@ def compute_session_decision(session: QuickSetSession) -> QuickSetSession:
     if not has_log_analysis:
         return session
 
+    evidence = _collect_session_evidence(session)
+    result, summary = compute_quickset_result(*evidence)
+    final_summary = summary or ""
+    if session.tv_model and session.tv_model not in final_summary:
+        suffix = f"TV model detected: {session.tv_model}."
+        final_summary = f"{final_summary} {suffix}".strip()
+
+    updated_steps: List[QuickSetStep] = []
+    last_summary_idx: Optional[int] = None
+    for idx, step in enumerate(session.steps):
+        updated_steps.append(step)
+        if step.name == "analysis_summary":
+            last_summary_idx = idx
+
+    if last_summary_idx is not None:
+        step = updated_steps[last_summary_idx]
+        metadata = dict(step.metadata or {})
+        metadata["analysis"] = final_summary or result.upper()
+        updated_steps[last_summary_idx] = step.model_copy(update={"metadata": metadata})
+
+    return session.model_copy(update={"result": result, "summary": final_summary, "steps": updated_steps})
+
+
+def _collect_session_evidence(
+    session: QuickSetSession,
+) -> Tuple[Optional[str], Optional[dict], Optional[dict], Optional[dict], Optional[dict]]:
     log_meta = _extract_latest_metadata(session.steps, "log_analysis_complete")
     log_state = None
     terminal_state = None
@@ -391,32 +416,42 @@ def compute_session_decision(session: QuickSetSession) -> QuickSetSession:
     probe_meta = _extract_latest_metadata(session.steps, "volume_probe_result")
     tv_meta = _extract_latest_metadata(session.steps, "tv_metadata")
 
-    result, summary = compute_quickset_result(
-        terminal_state,
-        log_state,
-        observations,
-        probe_meta,
-        tv_meta,
-    )
-    final_summary = summary or ""
-    if session.tv_model and session.tv_model not in final_summary:
-        suffix = f"TV model detected: {session.tv_model}."
-        final_summary = f"{final_summary} {suffix}".strip()
+    return terminal_state, log_state, observations, probe_meta, tv_meta
 
-    updated_steps: List[QuickSetStep] = []
-    last_summary_idx: Optional[int] = None
-    for idx, step in enumerate(session.steps):
-        updated_steps.append(step)
+
+def _sync_analysis_summary_step(
+    session_id: str,
+    steps: List[QuickSetStep],
+    final_status: str,
+    final_summary: str,
+) -> None:
+    summary_text = final_summary or final_status.upper()
+    for step in reversed(steps):
         if step.name == "analysis_summary":
-            last_summary_idx = idx
+            metadata = dict(step.metadata or {})
+            metadata["analysis"] = summary_text
+            metadata["tester_visible"] = True
+            quickset_session_store.replace_step(
+                session_id,
+                "analysis_summary",
+                QuickSetStep(
+                    name="analysis_summary",
+                    status=final_status,
+                    timestamp=step.timestamp or datetime.utcnow(),
+                    metadata=metadata,
+                ),
+            )
+            return
 
-    if last_summary_idx is not None:
-        step = updated_steps[last_summary_idx]
-        metadata = dict(step.metadata or {})
-        metadata["analysis"] = final_summary or result.upper()
-        updated_steps[last_summary_idx] = step.model_copy(update={"metadata": metadata})
-
-    return session.model_copy(update={"result": result, "summary": final_summary, "steps": updated_steps})
+    quickset_session_store.append_step(
+        session_id,
+        QuickSetStep(
+            name="analysis_summary",
+            status=final_status,
+            timestamp=datetime.utcnow(),
+            metadata={"analysis": summary_text, "tester_visible": True},
+        ),
+    )
 
 
 def _extract_latest_metadata(steps: List[QuickSetStep], step_name: str) -> Optional[dict]:

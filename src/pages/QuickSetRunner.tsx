@@ -212,7 +212,8 @@ const QuickSetRunner: React.FC = () => {
     if (metadata?.tester_visible === false) {
       return false;
     }
-    if (step.status === 'INFO') {
+    const normalizedStatus = (step.status || '').toLowerCase();
+    if (normalizedStatus === 'info') {
       if (metadata?.prompt || metadata?.analysis || metadata?.message) {
         return true;
       }
@@ -400,8 +401,10 @@ const QuickSetRunner: React.FC = () => {
                 {resultLabel}
               </span>
             </p>
-            <div className="hint" style={{ fontWeight: 600, marginTop: 8 }}>Summary</div>
-            <div className="hint" style={{ whiteSpace: 'pre-wrap' }}>{session?.summary || '—'}</div>
+            <div className="summary-block">
+              <div className="summary-block-label">Summary</div>
+              <div className="summary-block-text">{session?.summary || '—'}</div>
+            </div>
             <p className="hint">TV Model: {session?.tv_model || '—'}</p>
             <p className="hint">Started: {formatDateTime(session?.start_time)}</p>
             <p className="hint">Finished: {formatDateTime(session?.end_time)}</p>

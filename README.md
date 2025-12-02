@@ -18,3 +18,6 @@ python -m src.cli run --session-id VS_TEST_001 --stb-ip 192.168.1.125 --scenario
 source .venv/bin/activate
 python -m src.cli summarize --session-id VS_TEST_001 --scenario TV_AUTO_SYNC
 ```
+## Git Workflow
+לזרימת עבודה מומלצת עם Git עבור הפרויקט:
+[GIT_WORKFLOW.md](./GIT_WORKFLOW.md)
