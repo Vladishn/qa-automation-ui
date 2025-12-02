@@ -479,3 +479,50 @@ body {
   background: rgba(241, 196, 15, 0.22);
   color: #f1c40f;
 }
+
+/* Sidebar groups & hierarchy */
+
+.sidebar-header {
+  margin-bottom: 24px;
+}
+
+.sidebar-title {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.sidebar-subtitle {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.sidebar-group {
+  margin-top: 16px;
+}
+
+.sidebar-parent {
+  font-weight: 500;
+}
+
+.sidebar-children {
+  margin-top: 6px;
+  margin-left: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sidebar-child {
+  font-size: 13px;
+  opacity: 0.9;
+}
+
+.sidebar-child.nested {
+  margin-left: 10px;
+}
+
+.sidebar-item.active,
+.sidebar-parent.active {
+  border-radius: 999px;
+}
+
