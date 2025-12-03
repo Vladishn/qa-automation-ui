@@ -62,40 +62,6 @@ const getInfraStatusClass = (status: string): string => {
   return 'status-pill status-pill--info';
 };
 
-const getResultFromMetadata = (step: QuickSetStep): 'PASS' | 'FAIL' | null => {
-  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
-  const candidates: unknown[] = [
-    metadata.result,
-    metadata.analysis_result,
-    metadata.outcome,
-    metadata.verdict
-  ];
-
-  for (const value of candidates) {
-    if (typeof value !== 'string') continue;
-    const normalized = value.trim().toLowerCase();
-    if (!normalized) continue;
-
-    if (['pass', 'ok', 'success', 'successful'].includes(normalized)) {
-      return 'PASS';
-    }
-    if (['fail', 'failed', 'error'].includes(normalized)) {
-      return 'FAIL';
-    }
-  }
-
-  return null;
-};
-
-const extractQuestionId = (step: QuickSetStep): string | undefined => {
-  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
-  if (typeof metadata.question_id === 'string' && metadata.question_id.trim()) {
-    return metadata.question_id.trim().toLowerCase();
-  }
-  const match = step.name?.match(/^question_(.+?)(?:_answer)?$/i);
-  return match ? match[1].toLowerCase() : undefined;
-};
-
 const isYes = (value?: string): boolean => {
   if (!value) return false;
   return value.trim().toLowerCase() === 'yes';
@@ -121,12 +87,36 @@ const shouldDisplayInfraStep = (step: QuickSetStep): boolean => {
   const metadata = (step.metadata ?? {}) as Record<string, unknown>;
   const metaStatus = typeof metadata.status === 'string' ? metadata.status.toLowerCase() : '';
   const metaResult = typeof metadata.result === 'string' ? metadata.result.toLowerCase() : '';
-  return metaStatus === 'fail' || metaStatus === 'error' || metaResult === 'fail' || metaResult === 'error';
+  return (
+    metaStatus === 'fail' ||
+    metaStatus === 'error' ||
+    metaResult === 'fail' ||
+    metaResult === 'error'
+  );
+};
+
+const extractQuestionId = (step: QuickSetStep): string | null => {
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  const metaId = metadata.question_id;
+  if (typeof metaId === 'string' && metaId.trim()) {
+    return metaId.trim();
+  }
+  const name = step.name || '';
+  if (name.startsWith('question_')) {
+    const withoutPrefix = name.replace(/^question_/, '');
+    if (withoutPrefix.endsWith('_answer')) {
+      return withoutPrefix.replace(/_answer$/, '');
+    }
+    return withoutPrefix;
+  }
+  return null;
 };
 
 const shouldDisplayStep = (step: QuickSetStep): boolean => {
   const name = step.name || '';
   if (!name) return false;
+
+  // מוסתר לגמרי לפי הדרישה
   if (name === 'log_analysis_complete' || name === 'tester_questions') {
     return false;
   }
@@ -137,30 +127,39 @@ const shouldDisplayStep = (step: QuickSetStep): boolean => {
   }
 
   const questionId = extractQuestionId(step);
+
+  // לא מציגים את שורות ה־*_answer
   if (name.endsWith('_answer')) {
     return false;
   }
+
+  // לא מציגים את volume_probe כשורה נפרדת, הוא מחובר ל־tv_osd_seen
   if (questionId === 'volume_probe') {
     return false;
   }
 
+  // כל ה־question_* עצמם מוצגים (למעט החריגים למעלה)
   if (name.startsWith('question_')) {
     return true;
   }
 
+  // analysis_summary תמיד מוצג
   if (name === 'analysis_summary') {
     return true;
   }
 
+  // infra steps → מוצגים רק אם באמת חשוב (כשל)
   if (name.startsWith('adb_') || name.startsWith('logcat_')) {
     return shouldDisplayInfraStep(step);
   }
 
+  // INFO steps לא־infra מוצגים רק אם יש בהם מידע
   const statusLower = (step.status || '').toLowerCase();
   if (statusLower === 'info') {
     return Boolean(getStepInfo(step));
   }
 
+  // כל השאר: מוצג
   return true;
 };
 
@@ -177,14 +176,19 @@ const getQuestionStatus = (
   const hasAnswer = Boolean(answerValue.trim());
 
   switch (questionId) {
+    // ידני / notes – לא קובע PASS/FAIL
     case 'manual_trigger':
     case 'notes':
       return hasAnswer || sessionEnded ? 'INFO' : 'AWAITING INPUT';
+
+    // tv_volume_changed – פשוט: yes = PASS, no = FAIL (אם הוזן)
     case 'tv_volume_changed':
       if (!hasAnswer) {
         return sessionEnded ? 'INFO' : 'AWAITING INPUT';
       }
       return isYes(answerValue) ? 'PASS' : 'FAIL';
+
+    // tv_osd_seen – משולב עם volume_probe
     case 'tv_osd_seen': {
       const probeAnswer = getAnswerValue(answerMap.get('volume_probe'));
       const hasProbe = Boolean(probeAnswer.trim());
@@ -193,20 +197,27 @@ const getQuestionStatus = (
       }
       return isYes(answerValue) && isYes(probeAnswer) ? 'PASS' : 'FAIL';
     }
+
+    // pairing_screen_seen – דרישה קריטית
     case 'pairing_screen_seen':
       if (!hasAnswer) {
         return sessionEnded ? 'FAIL' : 'AWAITING INPUT';
       }
       return isYes(answerValue) ? 'PASS' : 'FAIL';
+
+    // tv_brand_ui – יש/אין ערך
     case 'tv_brand_ui':
       if (!hasAnswer) {
         return sessionEnded ? 'FAIL' : 'AWAITING INPUT';
       }
       return answerValue.trim().length > 0 ? 'PASS' : 'FAIL';
+
     default:
-      if (!hasAnswer) {
-        return sessionEnded ? 'INFO' : 'AWAITING INPUT';
+      // ברירת מחדל – התנהגות עדינה: אם אין תשובה והסשן רץ → AWAITING INPUT
+      if (!hasAnswer && !sessionEnded) {
+        return 'AWAITING INPUT';
       }
+      // אחרת INFO בלבד
       return 'INFO';
   }
 };
@@ -216,43 +227,33 @@ const getDisplayStatus = (
   session: QuickSetSession | null,
   answerMap: AnswerMap
 ): string => {
+  const raw = (step.status || '').toLowerCase();
+  const hasEnded = Boolean(session?.end_time);
+  const sessionResult = (session?.result || '').toLowerCase();
+
+  // analysis_summary צריך לשקף את תוצאת הסשן
+  if (step.name === 'analysis_summary' && (sessionResult === 'pass' || sessionResult === 'fail')) {
+    return sessionResult.toUpperCase();
+  }
+
   const questionId = extractQuestionId(step);
   if (questionId) {
     return getQuestionStatus(questionId, session, answerMap);
   }
 
-  if (step.name === 'analysis_summary') {
-    const sessionResult = (session?.result || '').toLowerCase();
-    if (sessionResult === 'pass' || sessionResult === 'fail') {
-      return sessionResult.toUpperCase();
-    }
-  }
-
-  const metadataResult = getResultFromMetadata(step);
-  if (metadataResult) {
-    return metadataResult;
-  }
-
-  const raw = (step.status || '').toLowerCase();
-  const hasEnded = Boolean(session?.end_time);
-
+  // לפני סוף הבדיקה – סטטוס "חי"
   if (!hasEnded) {
-    if (!raw) {
-      return 'RUNNING';
-    }
-    if (raw === 'pending') {
-      return 'AWAITING INPUT';
-    }
-    if (raw === 'info' || raw === 'running') {
-      return 'RUNNING';
-    }
+    if (!raw) return 'RUNNING';
+    if (raw === 'info' || raw === 'running') return 'INFO';
     return raw.toUpperCase();
   }
 
+  // אחרי סוף הבדיקה – אם יש PASS/FAIL מקומי, נכבד אותו
   if (raw === 'pass' || raw === 'fail') {
     return raw.toUpperCase();
   }
 
+  // אחרת, הכל INFO
   if (raw === 'running' || raw === 'info' || !raw) {
     return 'INFO';
   }
@@ -271,11 +272,13 @@ const buildStaticInfoText = (
     const prompt = typeof metadata.prompt === 'string' ? metadata.prompt : '';
     const answerValue = getAnswerValue(answerMap.get(questionId));
 
+    // tv_osd_seen → מוסיף לתיאור גם את volume_probe
     if (questionId === 'tv_osd_seen') {
       const probeStep = questionStepMap.get('volume_probe');
       const probeMeta = (probeStep?.metadata ?? {}) as Record<string, unknown>;
       const probePrompt = typeof probeMeta.prompt === 'string' ? probeMeta.prompt : '';
       const probeAnswer = getAnswerValue(answerMap.get('volume_probe'));
+
       const lines: string[] = [];
       if (prompt) lines.push(prompt);
       lines.push(`Answer: ${answerValue || '—'}`);
@@ -325,9 +328,11 @@ const QuickSetRunner: React.FC = () => {
 
   const scenarioName = 'TV_AUTO_SYNC' as const;
 
-  const handleChange = (field: keyof typeof form) => (event: React.ChangeEvent<HTMLInputElement>) => {
-    setForm((prev) => ({ ...prev, [field]: event.target.value }));
-  };
+  const handleChange =
+    (field: keyof typeof form) =>
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      setForm((prev) => ({ ...prev, [field]: event.target.value }));
+    };
 
   const onSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -358,6 +363,7 @@ const QuickSetRunner: React.FC = () => {
     }
   };
 
+  // polling על ה־session
   useEffect(() => {
     if (!sessionId || !activeApiKey) {
       return () => {};
@@ -485,6 +491,8 @@ const QuickSetRunner: React.FC = () => {
     try {
       setAnswerError(null);
       setIsAnswerSubmitting(true);
+      // 🔧 פה היה הבאג – חזרה לחתימה הנכונה:
+      // answerQuestion(sessionId, apiKey, value) שמחזיר Session מעודכן
       const updated = await answerQuestion(sessionId, activeApiKey, value);
       setSession(updated);
       setAnswerText('');
@@ -500,7 +508,12 @@ const QuickSetRunner: React.FC = () => {
     if (question.input_kind === 'continue') {
       return (
         <div style={questionActionsStyle}>
-          <button type="button" className="sidebar-item" disabled={disabled} onClick={() => submitAnswer('')}>
+          <button
+            type="button"
+            className="sidebar-item"
+            disabled={disabled}
+            onClick={() => submitAnswer('')}
+          >
             {isAnswerSubmitting ? 'Submitting…' : 'Continue'}
           </button>
         </div>
@@ -574,135 +587,140 @@ const QuickSetRunner: React.FC = () => {
     <section>
       <h2 className="page-title">QuickSet Runner · TV_AUTO_SYNC</h2>
       <p className="page-subtitle">
-        Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API key
-        to kick off the flow and monitor progress, steps, and logs in real time.
+        Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API
+        key to kick off the flow and monitor progress, steps, and logs in real time.
       </p>
 
-      {submitError && (
-        <p className="hint" style={{ color: '#e67e22' }}>
-          {submitError}
-        </p>
-      )}
-      {pollError && (
-        <p className="hint" style={{ color: '#e67e22' }}>
-          {pollError}
-        </p>
-      )}
-      {answerError && (
-        <p className="hint" style={{ color: '#e67e22' }}>
-          {answerError}
-        </p>
-      )}
+      <div className="layout-two-column">
+        <div className="card">
+          <h3>Run TV_AUTO_SYNC</h3>
+          <form onSubmit={onSubmit} className="form-grid">
+            <label className="form-field">
+              <span>Tester ID</span>
+              <input
+                type="text"
+                value={form.testerId}
+                onChange={handleChange('testerId')}
+                style={inputStyle}
+                placeholder="tester-1"
+              />
+            </label>
+            <label className="form-field">
+              <span>STB IP</span>
+              <input
+                type="text"
+                value={form.stbIp}
+                onChange={handleChange('stbIp')}
+                style={inputStyle}
+                placeholder="192.168.1.143"
+              />
+            </label>
+            <label className="form-field">
+              <span>API Key</span>
+              <input
+                type="password"
+                value={form.apiKey}
+                onChange={handleChange('apiKey')}
+                style={inputStyle}
+                placeholder="X-QuickSet-Api-Key"
+              />
+            </label>
 
-      <div className="card" style={{ marginBottom: 24 }}>
-        <h3>Run TV_AUTO_SYNC</h3>
-        <form onSubmit={onSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <label>
-            Tester ID
-            <input
-              type="text"
-              value={form.testerId}
-              onChange={handleChange('testerId')}
-              placeholder="tester-golan-001"
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            STB IP
-            <input
-              type="text"
-              value={form.stbIp}
-              onChange={handleChange('stbIp')}
-              placeholder="192.168.1.200"
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            API Key
-            <input
-              type="password"
-              value={form.apiKey}
-              onChange={handleChange('apiKey')}
-              placeholder="X-QuickSet-Api-Key"
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            Scenario
-            <input type="text" value={scenarioName} disabled style={inputStyle} />
-          </label>
-          <button type="submit" className="sidebar-item" disabled={isSubmitting || sessionActive}>
-            {isSubmitting ? 'Running…' : sessionActive ? 'Scenario Active' : 'Run TV_AUTO_SYNC'}
-          </button>
-        </form>
-      </div>
-
-      <div className="card" style={{ marginBottom: 24 }}>
-        <h3>Session Status</h3>
-        {sessionId ? (
-          <div>
-            <p className="hint">Session ID: {sessionId}</p>
-            <p className="hint">Scenario: {scenarioName}</p>
-            <p className="hint">
-              Result: <span className={getStatusClass(resultLabel)}>{resultLabel}</span>
-            </p>
-            <div className="summary-block">
-              <div className="summary-block-label">Summary</div>
-              <div className="summary-block-text">{session?.summary || '—'}</div>
+            <div className="form-actions">
+              <button type="submit" className="primary-btn" disabled={isSubmitting}>
+                {isSubmitting ? 'Running…' : 'Run TV_AUTO_SYNC'}
+              </button>
             </div>
-            <p className="hint">TV Model: {session?.tv_model || '—'}</p>
-            <p className="hint">Started: {formatDateTime(session?.start_time)}</p>
-            <p className="hint">Finished: {formatDateTime(session?.end_time)}</p>
-          </div>
-        ) : (
-          <p className="hint">No run started yet.</p>
-        )}
+          </form>
+          {submitError && <p className="error-text">Error: {submitError}</p>}
+          {pollError && <p className="error-text">Live update error: {pollError}</p>}
+        </div>
+
+        <div className="card">
+          <h3>Session Status</h3>
+          <dl className="session-meta">
+            <div>
+              <dt>Session ID</dt>
+              <dd>{session?.session_id || sessionId || '—'}</dd>
+            </div>
+            <div>
+              <dt>Tester</dt>
+              <dd>{session?.tester_id || form.testerId || '—'}</dd>
+            </div>
+            <div>
+              <dt>STB IP</dt>
+              <dd>{session?.stb_ip || form.stbIp || '—'}</dd>
+            </div>
+            <div>
+              <dt>Scenario</dt>
+              <dd>{session?.scenario_name || scenarioName}</dd>
+            </div>
+            <div>
+              <dt>Result</dt>
+              <dd>
+                <span className={getStatusClass(resultLabel)}>{resultLabel}</span>
+              </dd>
+            </div>
+            <div>
+              <dt>Started</dt>
+              <dd>{formatDateTime(session?.start_time)}</dd>
+            </div>
+            <div>
+              <dt>Finished</dt>
+              <dd>{formatDateTime(session?.end_time)}</dd>
+            </div>
+          </dl>
+
+          {session?.infra_checks && session.infra_checks.length > 0 && (
+            <div style={{ marginTop: 16 }}>
+              <h4>Infra Checks</h4>
+              <ul className="infra-list">
+                {session.infra_checks.map((check) => (
+                  <li key={check.name}>
+                    <span>{check.name}</span>
+                    <span className={getInfraStatusClass(check.status)}>{check.status}</span>
+                    {check.message && <span className="hint"> · {check.message}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {answerError && <p className="error-text">Answer error: {answerError}</p>}
+
+          {pendingQuestion && (
+            <div style={{ marginTop: 16 }}>
+              <h4>Pending Tester Input</h4>
+              <p className="hint" style={{ marginBottom: 8 }}>
+                {pendingQuestion.prompt}
+              </p>
+              {renderQuestionControls(pendingQuestion)}
+            </div>
+          )}
+        </div>
       </div>
 
-      {session?.infra_checks && session.infra_checks.length > 0 && (
-        <div className="card" style={{ marginBottom: 24 }}>
-          <h3>Infra Checks</h3>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Status</th>
-                <th>Details</th>
-              </tr>
-            </thead>
-            <tbody>
-              {session.infra_checks.map((check) => (
-                <tr key={check.name}>
-                  <td>{check.name}</td>
-                  <td>
-                    <span className={getInfraStatusClass(check.status)}>{check.status.toUpperCase()}</span>
-                  </td>
-                  <td>{check.message}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <div className="card" style={{ marginBottom: 24 }}>
+      <div className="card" style={{ marginTop: 24, marginBottom: 24 }}>
         <h3>Steps Timeline</h3>
-        {timelineRows.length === 0 ? (
-          <p className="hint">Steps will appear once the run starts.</p>
+        {!timelineRows.length ? (
+          <p className="hint">No steps yet. Start a session to see progress here.</p>
         ) : (
-          <div style={{ width: '100%', overflowX: 'auto' }}>
-            <table className="table" style={{ tableLayout: 'fixed', minWidth: 640 }}>
+          <div style={{ overflowX: 'auto' }}>
+            <table className="steps-table">
               <thead>
                 <tr>
-                  <th>Step</th>
-                  <th>Status</th>
-                  <th>Timestamp</th>
-                  <th>Info</th>
+                  <th style={{ minWidth: 200 }}>Step</th>
+                  <th style={{ minWidth: 120 }}>Status</th>
+                  <th style={{ minWidth: 200 }}>Timestamp</th>
+                  <th style={{ minWidth: 360 }}>Info</th>
                 </tr>
               </thead>
               <tbody>
                 {timelineRows.map((row) => (
-                  <tr key={`${row.step.name}-${row.step.timestamp ?? ''}-${row.status}`}>
+                  <tr
+                    key={`${row.step.name}-${row.step.timestamp || ''}-${row.status}`}
+                    className={`steps-row steps-row--${row.status.toLowerCase().replace(/\s+/g, '-')}`}
+                  >
                     <td>{row.step.name}</td>
                     <td>
                       <span className={getStatusClass(row.status)}>{row.status}</span>
