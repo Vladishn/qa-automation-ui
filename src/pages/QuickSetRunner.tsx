@@ -62,28 +62,252 @@ const getInfraStatusClass = (status: string): string => {
   return 'status-pill status-pill--info';
 };
 
-const getDisplayStatus = (step: QuickSetStep, session: QuickSetSession | null): string => {
-  const raw = (step.status || '').toLowerCase();
-  const hasEnded = Boolean(session?.end_time);
-  const sessionResult = (session?.result || '').toLowerCase();
+const getResultFromMetadata = (step: QuickSetStep): 'PASS' | 'FAIL' | null => {
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  const candidates: unknown[] = [
+    metadata.result,
+    metadata.analysis_result,
+    metadata.outcome,
+    metadata.verdict
+  ];
 
-  if (step.name === 'analysis_summary' && (sessionResult === 'pass' || sessionResult === 'fail')) {
-    return sessionResult.toUpperCase();
+  for (const value of candidates) {
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) continue;
+
+    if (['pass', 'ok', 'success', 'successful'].includes(normalized)) {
+      return 'PASS';
+    }
+    if (['fail', 'failed', 'error'].includes(normalized)) {
+      return 'FAIL';
+    }
   }
 
+  return null;
+};
+
+const extractQuestionId = (step: QuickSetStep): string | undefined => {
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  if (typeof metadata.question_id === 'string' && metadata.question_id.trim()) {
+    return metadata.question_id.trim().toLowerCase();
+  }
+  const match = step.name?.match(/^question_(.+?)(?:_answer)?$/i);
+  return match ? match[1].toLowerCase() : undefined;
+};
+
+const isYes = (value?: string): boolean => {
+  if (!value) return false;
+  return value.trim().toLowerCase() === 'yes';
+};
+
+const getAnswerValue = (answerStep?: QuickSetStep): string => {
+  const metadata = (answerStep?.metadata ?? {}) as Record<string, unknown>;
+  const value = metadata.answer;
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return String(value);
+  }
+  return '';
+};
+
+const shouldDisplayInfraStep = (step: QuickSetStep): boolean => {
+  const statusLower = (step.status || '').toLowerCase();
+  if (statusLower === 'fail') {
+    return true;
+  }
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  const metaStatus = typeof metadata.status === 'string' ? metadata.status.toLowerCase() : '';
+  const metaResult = typeof metadata.result === 'string' ? metadata.result.toLowerCase() : '';
+  return metaStatus === 'fail' || metaStatus === 'error' || metaResult === 'fail' || metaResult === 'error';
+};
+
+const shouldDisplayStep = (step: QuickSetStep): boolean => {
+  const name = step.name || '';
+  if (!name) return false;
+  if (name === 'log_analysis_complete' || name === 'tester_questions') {
+    return false;
+  }
+
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  if (metadata.tester_visible === false) {
+    return false;
+  }
+
+  const questionId = extractQuestionId(step);
+  if (name.endsWith('_answer')) {
+    return false;
+  }
+  if (questionId === 'volume_probe') {
+    return false;
+  }
+
+  if (name.startsWith('question_')) {
+    return true;
+  }
+
+  if (name === 'analysis_summary') {
+    return true;
+  }
+
+  if (name.startsWith('adb_') || name.startsWith('logcat_')) {
+    return shouldDisplayInfraStep(step);
+  }
+
+  const statusLower = (step.status || '').toLowerCase();
+  if (statusLower === 'info') {
+    return Boolean(getStepInfo(step));
+  }
+
+  return true;
+};
+
+type AnswerMap = Map<string, QuickSetStep>;
+type StepRow = { step: QuickSetStep; status: string; infoText: string };
+
+const getQuestionStatus = (
+  questionId: string,
+  session: QuickSetSession | null,
+  answerMap: AnswerMap
+): string => {
+  const sessionEnded = Boolean(session?.end_time);
+  const answerValue = getAnswerValue(answerMap.get(questionId));
+  const hasAnswer = Boolean(answerValue.trim());
+
+  switch (questionId) {
+    case 'manual_trigger':
+    case 'notes':
+      return hasAnswer || sessionEnded ? 'INFO' : 'AWAITING INPUT';
+    case 'tv_volume_changed':
+      if (!hasAnswer) {
+        return sessionEnded ? 'INFO' : 'AWAITING INPUT';
+      }
+      return isYes(answerValue) ? 'PASS' : 'FAIL';
+    case 'tv_osd_seen': {
+      const probeAnswer = getAnswerValue(answerMap.get('volume_probe'));
+      const hasProbe = Boolean(probeAnswer.trim());
+      if (!hasAnswer || !hasProbe) {
+        return sessionEnded ? 'FAIL' : 'AWAITING INPUT';
+      }
+      return isYes(answerValue) && isYes(probeAnswer) ? 'PASS' : 'FAIL';
+    }
+    case 'pairing_screen_seen':
+      if (!hasAnswer) {
+        return sessionEnded ? 'FAIL' : 'AWAITING INPUT';
+      }
+      return isYes(answerValue) ? 'PASS' : 'FAIL';
+    case 'tv_brand_ui':
+      if (!hasAnswer) {
+        return sessionEnded ? 'FAIL' : 'AWAITING INPUT';
+      }
+      return answerValue.trim().length > 0 ? 'PASS' : 'FAIL';
+    default:
+      if (!hasAnswer) {
+        return sessionEnded ? 'INFO' : 'AWAITING INPUT';
+      }
+      return 'INFO';
+  }
+};
+
+const getDisplayStatus = (
+  step: QuickSetStep,
+  session: QuickSetSession | null,
+  answerMap: AnswerMap
+): string => {
+  const questionId = extractQuestionId(step);
+  if (questionId) {
+    return getQuestionStatus(questionId, session, answerMap);
+  }
+
+  if (step.name === 'analysis_summary') {
+    const sessionResult = (session?.result || '').toLowerCase();
+    if (sessionResult === 'pass' || sessionResult === 'fail') {
+      return sessionResult.toUpperCase();
+    }
+  }
+
+  const metadataResult = getResultFromMetadata(step);
+  if (metadataResult) {
+    return metadataResult;
+  }
+
+  const raw = (step.status || '').toLowerCase();
+  const hasEnded = Boolean(session?.end_time);
+
   if (!hasEnded) {
-    return raw ? raw.toUpperCase() : 'RUNNING';
+    if (!raw) {
+      return 'RUNNING';
+    }
+    if (raw === 'pending') {
+      return 'AWAITING INPUT';
+    }
+    if (raw === 'info' || raw === 'running') {
+      return 'RUNNING';
+    }
+    return raw.toUpperCase();
   }
 
   if (raw === 'pass' || raw === 'fail') {
     return raw.toUpperCase();
   }
 
-  if (raw === 'running' || raw === 'info') {
+  if (raw === 'running' || raw === 'info' || !raw) {
     return 'INFO';
   }
 
-  return raw ? raw.toUpperCase() : 'INFO';
+  return raw.toUpperCase();
+};
+
+const buildStaticInfoText = (
+  step: QuickSetStep,
+  answerMap: AnswerMap,
+  questionStepMap: Map<string, QuickSetStep>
+): string => {
+  const questionId = extractQuestionId(step);
+  if (questionId) {
+    const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+    const prompt = typeof metadata.prompt === 'string' ? metadata.prompt : '';
+    const answerValue = getAnswerValue(answerMap.get(questionId));
+
+    if (questionId === 'tv_osd_seen') {
+      const probeStep = questionStepMap.get('volume_probe');
+      const probeMeta = (probeStep?.metadata ?? {}) as Record<string, unknown>;
+      const probePrompt = typeof probeMeta.prompt === 'string' ? probeMeta.prompt : '';
+      const probeAnswer = getAnswerValue(answerMap.get('volume_probe'));
+      const lines: string[] = [];
+      if (prompt) lines.push(prompt);
+      lines.push(`Answer: ${answerValue || '—'}`);
+      if (probePrompt) {
+        lines.push(`Volume probe: ${probePrompt}`);
+      }
+      lines.push(`Probe answer: ${probeAnswer || '—'}`);
+      return lines.join('\n');
+    }
+
+    const lines: string[] = [];
+    if (prompt) lines.push(prompt);
+    lines.push(`Answer: ${answerValue || '—'}`);
+    return lines.join('\n');
+  }
+
+  if (step.name === 'analysis_summary') {
+    const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+    if (typeof metadata.analysis === 'string' && metadata.analysis.trim()) {
+      return metadata.analysis.trim();
+    }
+  }
+
+  if (step.name.startsWith('adb_') || step.name.startsWith('logcat_')) {
+    const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+    const message = typeof metadata.message === 'string' ? metadata.message : '';
+    const error = typeof metadata.error === 'string' ? metadata.error : '';
+    if (message) return message;
+    if (error) return `Error: ${error}`;
+  }
+
+  return getStepInfo(step) || '';
 };
 
 const QuickSetRunner: React.FC = () => {
@@ -207,25 +431,52 @@ const QuickSetRunner: React.FC = () => {
 
   const steps: QuickSetStep[] = session?.steps ?? [];
 
-  const shouldDisplayStep = (step: QuickSetStep): boolean => {
-    const metadata = (step.metadata ?? {}) as Record<string, any>;
-    if (metadata?.tester_visible === false) {
-      return false;
-    }
-    const normalizedStatus = (step.status || '').toLowerCase();
-    if (normalizedStatus === 'info') {
-      if (metadata?.prompt || metadata?.analysis || metadata?.message) {
-        return true;
+  const answerMap = useMemo<AnswerMap>(() => {
+    const map = new Map<string, QuickSetStep>();
+    steps.forEach((step) => {
+      const questionId = extractQuestionId(step);
+      if (!questionId) return;
+      if (step.name.endsWith('_answer')) {
+        map.set(questionId, step);
       }
-      if (step.name.startsWith('question_')) {
-        return true;
-      }
-      return false;
-    }
-    return true;
-  };
+    });
+    return map;
+  }, [steps]);
 
-  const visibleSteps = steps.filter(shouldDisplayStep);
+  const questionStepMap = useMemo(() => {
+    const map = new Map<string, QuickSetStep>();
+    steps.forEach((step) => {
+      const questionId = extractQuestionId(step);
+      if (!questionId) return;
+      if (!step.name.endsWith('_answer')) {
+        map.set(questionId, step);
+      }
+    });
+    return map;
+  }, [steps]);
+
+  const timelineRows = useMemo<StepRow[]>(() => {
+    if (!steps.length) {
+      return [];
+    }
+    const filtered = steps.filter(shouldDisplayStep);
+    const dedupe = new Set<string>();
+    const rows: StepRow[] = [];
+
+    filtered.forEach((step) => {
+      const statusLabel = getDisplayStatus(step, session, answerMap);
+      const infoText = buildStaticInfoText(step, answerMap, questionStepMap);
+      const timestampKey = step.timestamp ? new Date(step.timestamp).toISOString() : 'no-ts';
+      const dedupeKey = `${step.name}|${statusLabel}|${timestampKey}|${infoText}`;
+      if (dedupe.has(dedupeKey)) {
+        return;
+      }
+      dedupe.add(dedupeKey);
+      rows.push({ step, status: statusLabel, infoText });
+    });
+
+    return rows;
+  }, [steps, session, answerMap, questionStepMap]);
 
   const submitAnswer = async (value: string) => {
     if (!sessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {
@@ -301,7 +552,7 @@ const QuickSetRunner: React.FC = () => {
     );
   };
 
-  const renderStepInfo = (step: QuickSetStep): React.ReactNode => {
+  const renderStepInfo = (step: QuickSetStep, infoText: string): React.ReactNode => {
     if (pendingQuestion && pendingQuestion.step_name === step.name) {
       return (
         <div style={questionBlockStyle}>
@@ -312,7 +563,7 @@ const QuickSetRunner: React.FC = () => {
         </div>
       );
     }
-    return getStepInfo(step) || '—';
+    return <span style={{ whiteSpace: 'pre-wrap' }}>{infoText || '—'}</span>;
   };
 
   const sessionActive = Boolean(
@@ -345,10 +596,7 @@ const QuickSetRunner: React.FC = () => {
 
       <div className="card" style={{ marginBottom: 24 }}>
         <h3>Run TV_AUTO_SYNC</h3>
-        <form
-          onSubmit={onSubmit}
-          style={{ display: 'flex', flexDirection: 'column', gap: 12 }}
-        >
+        <form onSubmit={onSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <label>
             Tester ID
             <input
@@ -396,10 +644,7 @@ const QuickSetRunner: React.FC = () => {
             <p className="hint">Session ID: {sessionId}</p>
             <p className="hint">Scenario: {scenarioName}</p>
             <p className="hint">
-              Result:{' '}
-              <span className={getStatusClass(resultLabel)}>
-                {resultLabel}
-              </span>
+              Result: <span className={getStatusClass(resultLabel)}>{resultLabel}</span>
             </p>
             <div className="summary-block">
               <div className="summary-block-label">Summary</div>
@@ -442,34 +687,33 @@ const QuickSetRunner: React.FC = () => {
 
       <div className="card" style={{ marginBottom: 24 }}>
         <h3>Steps Timeline</h3>
-        {visibleSteps.length === 0 ? (
+        {timelineRows.length === 0 ? (
           <p className="hint">Steps will appear once the run starts.</p>
         ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Step</th>
-                <th>Status</th>
-                <th>Timestamp</th>
-                <th>Info</th>
-              </tr>
-            </thead>
-            <tbody>
-              {visibleSteps.map((step) => {
-                const displayStatus = getDisplayStatus(step, session);
-                return (
-                  <tr key={`${step.name}-${step.timestamp ?? ''}`}>
-                    <td>{step.name}</td>
+          <div style={{ width: '100%', overflowX: 'auto' }}>
+            <table className="table" style={{ tableLayout: 'fixed', minWidth: 640 }}>
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Status</th>
+                  <th>Timestamp</th>
+                  <th>Info</th>
+                </tr>
+              </thead>
+              <tbody>
+                {timelineRows.map((row) => (
+                  <tr key={`${row.step.name}-${row.step.timestamp ?? ''}-${row.status}`}>
+                    <td>{row.step.name}</td>
                     <td>
-                      <span className={getStatusClass(displayStatus)}>{displayStatus}</span>
+                      <span className={getStatusClass(row.status)}>{row.status}</span>
                     </td>
-                    <td>{formatDateTime(step.timestamp)}</td>
-                    <td>{renderStepInfo(step)}</td>
+                    <td>{formatDateTime(row.step.timestamp)}</td>
+                    <td>{renderStepInfo(row.step, row.infoText)}</td>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 
