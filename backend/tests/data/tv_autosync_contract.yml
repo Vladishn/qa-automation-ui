@@ -1,0 +1,77 @@
+# backend/tests/data/tv_autosync_contract.yml
+scenarios:
+  happy_path:
+    description: "TV auto-sync happy path – everything works, Samsung TV."
+    session_id: "QS_7B4CC116"
+    expected_summary:
+      scenario_name: "TV_AUTO_SYNC"
+      overall_status: "PASS"
+      analysis_text: "TV auto-sync completed successfully with no detected issues."
+      brand_mismatch: false
+      tv_brand_user: "Samsung"
+      tv_brand_log: "Samsung"
+      has_volume_issue: false
+      has_osd_issue: false
+      has_failure: false
+    expected_steps:
+      question_tv_volume_changed: "PASS"
+      question_tv_osd_seen: "PASS"
+      question_tv_brand_ui: "PASS"
+      analysis_summary: "PASS"
+
+  no_volume_change_issue:
+    description: "Tester טוען שאין שינוי ווליום/OSD אבל הלוגים מראים שה-TV בשליטה."
+    session_id: "QS_EF1DBD50"
+    expected_summary:
+      scenario_name: "TV_AUTO_SYNC"
+      overall_status: "FAIL"
+      analysis_text: "TV auto-sync failed: TV volume/behavior did not match expectations."
+      brand_mismatch: false
+      tv_brand_user: "Samsung"
+      tv_brand_log: "Samsung"
+      has_volume_issue: true
+      has_osd_issue: true
+      has_failure: true
+    expected_steps:
+      question_tv_volume_changed: "FAIL"
+      question_tv_osd_seen: "FAIL"
+      question_tv_brand_ui: "PASS"
+      analysis_summary: "FAIL"
+
+  brand_mismatch_only:
+    description: "Brand mismatch נקי – Volume/OSD תקינים, מותג ב-UI לא תואם לוג."
+    session_id: "QS_862C29BF"
+    expected_summary:
+      scenario_name: "TV_AUTO_SYNC"
+      overall_status: "FAIL"
+      analysis_text: "TV auto-sync failed: TV brand seen by tester does not match logs."
+      brand_mismatch: true
+      tv_brand_user: "LG"
+      tv_brand_log: "Samsung"
+      has_volume_issue: false
+      has_osd_issue: false
+      has_failure: true
+    expected_steps:
+      question_tv_volume_changed: "PASS"
+      question_tv_osd_seen: "PASS"
+      question_tv_brand_ui: "FAIL"
+      analysis_summary: "FAIL"
+
+  volume_mismatch_only:
+    description: "Volume mismatch אמיתי – STB שולט / OSD שגוי, מותג תקין."
+    session_id: "QS_8DEC5CC6"
+    expected_summary:
+      scenario_name: "TV_AUTO_SYNC"
+      overall_status: "FAIL"
+      analysis_text: "TV auto-sync failed: TV volume/behavior did not match expectations."
+      brand_mismatch: false
+      tv_brand_user: "Samsung"
+      tv_brand_log: "Samsung"
+      has_volume_issue: true
+      has_osd_issue: true
+      has_failure: true
+    expected_steps:
+      question_tv_volume_changed: "FAIL"
+      question_tv_osd_seen: "FAIL"
+      question_tv_brand_ui: "PASS"
+      analysis_summary: "FAIL"
