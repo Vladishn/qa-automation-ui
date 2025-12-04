@@ -1,5 +1,5 @@
 import { apiGet, apiPost } from './httpClient';
-import type { QuickSetSession } from '../types/domain';
+import type { QuickSetSession, SessionTimelineResponse } from '../types/domain';
 
 export interface RunScenarioParams {
   testerId: string;
@@ -48,4 +48,8 @@ export async function answerQuestion(sessionId: string, apiKey: string, answer: 
       },
     }
   );
+}
+
+export async function fetchSessionTimeline(sessionId: string): Promise<SessionTimelineResponse> {
+  return apiGet<SessionTimelineResponse>(`/api/sessions/${sessionId}`);
 }

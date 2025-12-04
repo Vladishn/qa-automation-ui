@@ -34,14 +34,6 @@ def create_session(payload: SessionCreateRequest) -> Session:
     return _map_session(session)
 
 
-@router.get("/{session_id}", response_model=Session)
-def get_session(session_id: str) -> Session:
-    session = storage.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-    return _map_session(session)
-
-
 @router.get("/", response_model=List[Session])
 def list_sessions() -> List[Session]:
     return [_map_session(session) for session in storage.list_sessions()]

@@ -65,13 +65,16 @@ class VolumeBehaviorProbe:
                 )
         return matches
 
-    def run_probe(self, step_logger: Any, ask: Any) -> Dict[str, Any]:
+    def run_probe(self, step_logger: Any, ask: Any | None = None) -> Dict[str, Any]:
         instruction = (
             "Volume Behavior Probe:\n"
-            "Please press Volume UP on the remote three times, then press Enter here."
+            "Monitoring logs for recent volume control events."
         )
-        step_logger.log_step("volume_probe_prompt", "INFO", {"instruction": instruction})
-        ask("volume_probe", instruction)
+        step_logger.log_step(
+            "volume_probe_prompt",
+            "INFO",
+            {"instruction": instruction, "tester_visible": False},
+        )
 
         log_text = self._read_log_text()
         raw_code = self._find_last_volume_code(log_text)

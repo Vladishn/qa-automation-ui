@@ -13,6 +13,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from pydantic import BaseModel, Field
 
 from ..adb_service import AdbPrecheckResult, AdbPrecheckStatus, precheck
+from ..config import settings
 from ..models import (
     QuickSetInfraCheck,
     QuickSetQuestion,
@@ -30,7 +31,7 @@ from src.qa.step_logger import StepLogger  # noqa: E402
 from src.quickset.scenarios.tv_auto_sync import TvAutoSyncScenario  # noqa: E402
 
 RAW_LOG_DIR = PROJECT_ROOT / "artifacts" / "quickset_logs"
-STEP_LOG_DIR = PROJECT_ROOT / "artifacts" / "quickset_steps"
+STEP_LOG_DIR = Path(settings.quickset_steps_dir)
 KNOWLEDGE_PATH = PROJECT_ROOT / "knowledge" / "scenarios" / "tv_auto_sync.yaml"
 
 RAW_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,7 +43,6 @@ BOOLEAN_QUESTION_IDS = {
     "tv_volume_changed",
     "tv_osd_seen",
     "pairing_screen_seen",
-    "volume_probe",
 }
 TEXT_QUESTION_IDS = {"tv_brand_ui", "notes"}
 CONTINUE_QUESTION_IDS = {"manual_trigger"}
@@ -104,7 +104,7 @@ def get_session(
 ) -> QuickSetSession:
     session = quickset_session_store.get_session(session_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
     return compute_session_decision(session)
 
 
@@ -116,7 +116,7 @@ def answer_question(
 ) -> QuickSetSession:
     session = quickset_session_store.get_session(session_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
     if session.pending_question is None or session.state != "awaiting_input":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session is not awaiting input")
 

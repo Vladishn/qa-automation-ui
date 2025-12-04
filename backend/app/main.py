@@ -7,6 +7,8 @@ from .routers import app as app_router
 from .routers import fw as fw_router
 from .routers import quickset as quickset_router
 from .routers import sessions as sessions_router
+from .routers import debug_quickset as debug_quickset_router
+from .routers import timeline as timeline_router
 
 app = FastAPI(title="QA Automation Backend", version="0.1.0")
 
@@ -29,6 +31,8 @@ app.include_router(fw_router.router, prefix=api_prefix)
 app.include_router(app_router.router, prefix=api_prefix)
 app.include_router(sessions_router.router, prefix=api_prefix)
 app.include_router(quickset_router.router, prefix=api_prefix)
+app.include_router(debug_quickset_router.router, prefix=api_prefix)
+app.include_router(timeline_router.router, prefix=api_prefix)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,78 @@
+.steps-timeline-container {
+  width: 100%;
+}
+
+.steps-timeline-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  margin-bottom: 12px;
+  color: var(--color-text, #f5f7ff);
+}
+
+.steps-timeline-summary-label {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.steps-timeline-summary-flags {
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.steps-timeline-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.steps-timeline-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 0.85rem;
+}
+
+.steps-timeline-table th,
+.steps-timeline-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+  vertical-align: top;
+}
+
+.steps-timeline-table th {
+  font-weight: 600;
+  color: var(--color-text-muted, #9ca3c7);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.75rem;
+}
+
+.steps-timeline-table td {
+  color: var(--color-text, #f5f7ff);
+}
+
+.steps-timeline-col-step {
+  width: 18%;
+}
+
+.steps-timeline-col-status {
+  width: 12%;
+}
+
+.steps-timeline-col-timestamp {
+  width: 20%;
+}
+
+.steps-timeline-col-info {
+  width: 50%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+.steps-timeline-table tr:last-child td {
+  border-bottom: none;
+}

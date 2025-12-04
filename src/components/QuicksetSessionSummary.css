@@ -1,0 +1,64 @@
+.qs-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.qs-summary-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.qs-summary-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.qs-summary-subtitle {
+  font-size: 0.8rem;
+  color: var(--color-text-muted, #9ca3c7);
+}
+
+.qs-summary-analysis {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--color-text, #f5f7ff);
+}
+
+.qs-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px 16px;
+  margin: 0;
+}
+
+.qs-summary-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.qs-summary-row dt {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted, #9ca3c7);
+}
+
+.qs-summary-row dd {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--color-text, #f5f7ff);
+}
+
+.qs-summary-flag {
+  color: #ffb347;
+  font-weight: 600;
+}
+
+.qs-summary-detail {
+  font-size: 0.75rem;
+  color: var(--color-text-muted, #9ca3c7);
+}
