@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
 
+from ..regression_snapshots import save_session_snapshot
 from ..models import SessionModel
 from ..schemas import Session, SessionCreateRequest
 from ..storage import storage
@@ -37,6 +38,25 @@ def create_session(payload: SessionCreateRequest) -> Session:
 @router.get("/", response_model=List[Session])
 def list_sessions() -> List[Session]:
     return [_map_session(session) for session in storage.list_sessions()]
+
+
+@router.get("/sessions/{session_id}/snapshot")
+def get_session_snapshot(session_id: str):
+    """
+    Export a full JSON snapshot for the given session_id and
+    persist it as a regression artifact.
+    """
+    session = storage.get_session(session_id)
+
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Produce a JSON-serializable payload via the Pydantic schema to keep parity with other endpoints.
+    data = _map_session(session).model_dump(mode="json", by_alias=True)
+
+    artifact_path = save_session_snapshot(session_id, data)
+    data["artifact_path"] = artifact_path
+    return data
 
 
 def _map_session(model: SessionModel) -> Session:

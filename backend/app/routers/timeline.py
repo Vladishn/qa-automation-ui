@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, status
 
 from ..config import settings
-from ...quickset_timeline_analyzer import build_timeline_and_summary
+from ..quickset_timeline_analyzer import build_timeline_and_summary
 
 router = APIRouter(prefix="/sessions", tags=["timeline"])
 logger = logging.getLogger(__name__)
