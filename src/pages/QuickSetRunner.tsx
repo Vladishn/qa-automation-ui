@@ -1,14 +1,21 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import StepsTimeline from '../components/StepsTimeline';
 import QuicksetSessionSummary from '../components/QuicksetSessionSummary';
-import type { QuickSetQuestion, QuickSetSession, SessionSummary, TimelineRow } from '../types/domain';
-import { runScenario, getSession, answerQuestion, fetchSessionTimeline } from '../services/quicksetService';
+import type { QuickSetQuestion } from '../types/domain';
+import type { MetricTriState, QuicksetAnalysisDetails, TvAutoSyncTimelineEvent } from '../types/quickset';
+import { deriveUiStatusFromAnalyzer } from '../logic/quicksetStatus';
+import { deriveMetricStatuses } from '../logic/quicksetMetrics';
+import { runScenario, answerQuestion } from '../services/quicksetService';
+import { useSessionPolling } from '../hooks/useSessionPolling';
 
 const defaultForm = {
   testerId: '',
   stbIp: '',
   apiKey: ''
 };
+
+const scenarioOptions = [{ value: 'TV_AUTO_SYNC' as const, label: 'TV Auto Sync' }];
+type TimelineRowWithStatus = TvAutoSyncTimelineEvent & { statusDisplay?: MetricTriState };
 
 const formatDateTime = (value?: string | null): string => {
   if (!value) return '—';
@@ -35,6 +42,7 @@ const getStatusClass = (label: string): string => {
   const normalized = label.toUpperCase();
   if (normalized === 'PASS') return 'status-pill status-pill--pass';
   if (normalized === 'FAIL') return 'status-pill status-pill--fail';
+  if (normalized === 'PENDING') return 'status-pill status-pill--running';
   if (normalized === 'RUNNING') return 'status-pill status-pill--running';
   if (normalized === 'AWAITING INPUT') return 'status-pill status-pill--running';
   if (normalized === 'AWAITING_INPUT') return 'status-pill status-pill--running';
@@ -54,29 +62,31 @@ const QuickSetRunner: React.FC = () => {
   const [form, setForm] = useState(defaultForm);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [activeApiKey, setActiveApiKey] = useState<string | null>(null);
-  const [session, setSession] = useState<QuickSetSession | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [pollError, setPollError] = useState<string | null>(null);
   const [answerError, setAnswerError] = useState<string | null>(null);
   const [answerText, setAnswerText] = useState('');
   const [isAnswerSubmitting, setIsAnswerSubmitting] = useState(false);
-  const pendingQuestion = session?.pending_question ?? null;
-  const [sessionSummary, setSessionSummary] = useState<SessionSummary | null>(null);
-  const [timeline, setTimeline] = useState<TimelineRow[]>([]);
-  const [timelineLoading, setTimelineLoading] = useState(false);
-  const [timelineError, setTimelineError] = useState<string | null>(null);
+
+  const { data: sessionData, error: pollError, setData: setSessionEnvelope } =
+    useSessionPolling(sessionId, activeApiKey);
+
+  const analyzerSession = sessionData?.session ?? null;
+  const runtimeSession = sessionData?.quickset_session ?? null;
+  const timeline = (sessionData?.timeline ?? []) as TvAutoSyncTimelineEvent[];
+  const pendingQuestion = runtimeSession?.pending_question ?? null;
 
   const scenarioName = 'TV_AUTO_SYNC' as const;
 
-  const handleChange = (field: keyof typeof form) => (event: React.ChangeEvent<HTMLInputElement>) => {
-    setForm((prev) => ({ ...prev, [field]: event.target.value }));
-  };
+  const handleChange =
+    (field: keyof typeof form) =>
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      setForm((prev) => ({ ...prev, [field]: event.target.value }));
+    };
 
   const onSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     setSubmitError(null);
-    setPollError(null);
 
     if (!form.testerId || !form.stbIp || !form.apiKey) {
       setSubmitError('Tester ID, STB IP, and API key are required.');
@@ -93,7 +103,7 @@ const QuickSetRunner: React.FC = () => {
       });
       setSessionId(response.session_id);
       setActiveApiKey(form.apiKey);
-      setSession(null);
+      setSessionEnvelope(null);
       setAnswerText('');
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : 'Failed to run scenario');
@@ -103,117 +113,52 @@ const QuickSetRunner: React.FC = () => {
   };
 
   useEffect(() => {
-    if (!sessionId || !activeApiKey) {
-      return () => {};
-    }
-
-    let cancelled = false;
-    let intervalId: number | undefined;
-
-    const fetchSession = async () => {
-      try {
-        const data = await getSession(sessionId, activeApiKey);
-        if (cancelled) {
-          return;
-        }
-        setSession(data);
-        if (data.result && data.result !== 'pending' && data.result !== 'running') {
-          if (intervalId) {
-            window.clearInterval(intervalId);
-            intervalId = undefined;
-          }
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setPollError('Failed to fetch session status');
-          if (intervalId) {
-            window.clearInterval(intervalId);
-            intervalId = undefined;
-          }
-        }
-      }
-    };
-
-    fetchSession();
-    intervalId = window.setInterval(fetchSession, 1500);
-
-    return () => {
-      cancelled = true;
-      if (intervalId) {
-        window.clearInterval(intervalId);
-      }
-    };
-  }, [sessionId, activeApiKey]);
-
-  useEffect(() => {
     setAnswerText('');
   }, [pendingQuestion?.id]);
 
-  useEffect(() => {
-    if (!sessionId) {
-      setSessionSummary(null);
-      setTimeline([]);
-      setTimelineError(null);
-      setTimelineLoading(false);
-      return () => {};
+  const analyzerUi = useMemo(
+    () => (analyzerSession ? deriveUiStatusFromAnalyzer(analyzerSession) : null),
+    [analyzerSession]
+  );
+
+  const resultLabel = analyzerUi?.label ?? 'Not started';
+  const analysisSummaryRow = useMemo(
+    () => timeline.find((row) => row.name === 'analysis_summary'),
+    [timeline]
+  );
+  const analysisDetails = useMemo(
+    () => (analysisSummaryRow ? (analysisSummaryRow.details as QuicksetAnalysisDetails) : undefined),
+    [analysisSummaryRow]
+  );
+  const metricStatuses = useMemo(
+    () => (analyzerSession ? deriveMetricStatuses(analyzerSession, analysisDetails) : null),
+    [analyzerSession, analysisDetails]
+  );
+  const timelineForDisplay = useMemo<TimelineRowWithStatus[] | null>(() => {
+    if (!analyzerSession) {
+      return null;
     }
-
-    setSessionSummary(null);
-    setTimeline([]);
-    setTimelineError(null);
-    const currentSessionId = sessionId;
-
-    let cancelled = false;
-    let pollId: number | null = null;
-
-    const load = async (showSpinner: boolean) => {
-      if (showSpinner) {
-        setTimelineLoading(true);
-      }
-      try {
-        const data = await fetchSessionTimeline(currentSessionId);
-        if (!cancelled) {
-          setSessionSummary(data.session);
-          setTimeline(data.timeline ?? []);
-          setTimelineError(null);
-          const finished = data.session.overall_status !== 'AWAITING_INPUT' && (data.timeline?.length ?? 0) > 0;
-          if (finished && pollId !== null) {
-            window.clearInterval(pollId);
-            pollId = null;
-          }
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setTimelineError(err instanceof Error ? err.message : 'Failed to load timeline');
-        }
-      } finally {
-        if (!cancelled && showSpinner) {
-          setTimelineLoading(false);
-        }
-      }
-    };
-
-    load(true);
-    pollId = window.setInterval(() => {
-      void load(false);
-    }, 2000);
-
-    return () => {
-      cancelled = true;
-      if (pollId !== null) {
-        window.clearInterval(pollId);
-      }
-    };
-  }, [sessionId]);
-
-  const resultLabel = useMemo(() => {
-    if (sessionSummary) {
-      return sessionSummary.overall_status === 'AWAITING_INPUT'
-        ? 'AWAITING INPUT'
-        : sessionSummary.overall_status;
+    if (!metricStatuses) {
+      return timeline;
     }
-    return 'Not started';
-  }, [sessionSummary]);
+    return timeline.map((row) => {
+      let statusDisplay: MetricTriState | undefined;
+      switch (row.name) {
+        case 'question_tv_volume_changed':
+          statusDisplay = metricStatuses.volumeStatus;
+          break;
+        case 'question_tv_osd_seen':
+          statusDisplay = metricStatuses.osdStatus;
+          break;
+        case 'question_tv_brand_ui':
+          statusDisplay = metricStatuses.brandStatus;
+          break;
+        default:
+          break;
+      }
+      return statusDisplay ? { ...row, statusDisplay } : row;
+    });
+  }, [analyzerSession, metricStatuses, timeline]);
 
   const submitAnswer = async (value: string) => {
     if (!sessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {
@@ -223,7 +168,7 @@ const QuickSetRunner: React.FC = () => {
       setAnswerError(null);
       setIsAnswerSubmitting(true);
       const updated = await answerQuestion(sessionId, activeApiKey, value);
-      setSession(updated);
+      setSessionEnvelope(updated);
       setAnswerText('');
     } catch (error) {
       setAnswerError(error instanceof Error ? error.message : 'Failed to send answer');
@@ -234,10 +179,16 @@ const QuickSetRunner: React.FC = () => {
 
   const renderQuestionControls = (question: QuickSetQuestion) => {
     const disabled = isAnswerSubmitting || !sessionId || !activeApiKey;
+
     if (question.input_kind === 'continue') {
       return (
         <div style={questionActionsStyle}>
-          <button type="button" className="sidebar-item" disabled={disabled} onClick={() => submitAnswer('')}>
+          <button
+            type="button"
+            className="sidebar-item"
+            disabled={disabled}
+            onClick={() => submitAnswer('')}
+          >
             {isAnswerSubmitting ? 'Submitting…' : 'Continue'}
           </button>
         </div>
@@ -290,40 +241,37 @@ const QuickSetRunner: React.FC = () => {
   };
 
   const sessionActive = Boolean(
-    session && sessionId && (session.state === 'running' || session.state === 'awaiting_input')
+    runtimeSession &&
+      sessionId &&
+      (runtimeSession.state === 'running' || runtimeSession.state === 'awaiting_input')
   );
 
-  const showLogs = sessionSummary?.has_failure === true;
-  const timelineForDisplay = sessionSummary ? timeline : null;
-  const startedAt = formatDateTime(sessionSummary?.started_at);
-  const finishedAt = formatDateTime(sessionSummary?.finished_at);
+  const showLogs = analyzerSession?.has_failure === true;
+  const startedAt = formatDateTime(analyzerSession?.started_at);
+  const finishedAt = formatDateTime(analyzerSession?.finished_at);
 
   const renderQuicksetSummary = () => {
     if (!sessionId) {
       return <p className="hint">Run a session to see the QuickSet analysis summary.</p>;
     }
-    if (timelineError) {
-      return (
-        <p className="hint" style={{ color: '#ff8a8a' }}>
-          Failed to load summary: {timelineError}
-        </p>
-      );
+    if (!analyzerSession) {
+      return <p className="hint">Analyzer output not available yet.</p>;
     }
-    if (timelineLoading && !sessionSummary) {
-      return <p className="hint">Loading analysis summary…</p>;
-    }
-    if (!sessionSummary) {
-      return <p className="hint">No analysis summary yet.</p>;
-    }
-    return <QuicksetSessionSummary session={sessionSummary} timeline={timeline} />;
+    return (
+      <QuicksetSessionSummary
+        session={analyzerSession}
+        timeline={timeline}
+        metricStatuses={metricStatuses}
+      />
+    );
   };
 
   return (
-    <section>
+    <div className="w-full max-w-[1800px] mx-auto px-6 py-10 lg:px-12 lg:py-12">
       <h2 className="page-title">QuickSet Runner · TV_AUTO_SYNC</h2>
       <p className="page-subtitle">
-        Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API key
-        to kick off the flow and monitor progress, steps, and logs in real time.
+        Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API
+        key to kick off the flow and monitor progress, steps, and logs in real time.
       </p>
 
       {submitError && (
@@ -342,143 +290,172 @@ const QuickSetRunner: React.FC = () => {
         </p>
       )}
 
-      <div className="card" style={{ marginBottom: 24 }}>
-        <h3>Run TV_AUTO_SYNC</h3>
-        <form onSubmit={onSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <label>
-            Tester ID
-            <input
-              type="text"
-              value={form.testerId}
-              onChange={handleChange('testerId')}
-              placeholder="tester-golan-001"
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            STB IP
-            <input
-              type="text"
-              value={form.stbIp}
-              onChange={handleChange('stbIp')}
-              placeholder="192.168.1.200"
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            API Key
-            <input
-              type="password"
-              value={form.apiKey}
-              onChange={handleChange('apiKey')}
-              placeholder="X-QuickSet-Api-Key"
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            Scenario
-            <input type="text" value={scenarioName} disabled style={inputStyle} />
-          </label>
-          <button type="submit" className="sidebar-item" disabled={isSubmitting || sessionActive}>
-            {isSubmitting ? 'Running…' : sessionActive ? 'Scenario Active' : 'Run TV_AUTO_SYNC'}
-          </button>
-        </form>
+      {/* TOP ROW: Run form + Session status */}
+      <div className="mt-6 grid grid-cols-1 gap-12 lg:grid-cols-2">
+        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
+          <h3 className="text-lg font-semibold">Run QuickSet Scenario</h3>
+          <form onSubmit={onSubmit} className="flex flex-col space-y-4">
+            <label className="flex flex-col space-y-1 text-sm font-medium">
+              <span>Scenario</span>
+              <select
+                value={scenarioName}
+                disabled
+                className="mt-0 w-full rounded-lg border border-white/20 bg-transparent p-2 text-sm"
+              >
+                {scenarioOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="flex flex-col space-y-1 text-sm font-medium">
+              <span>Tester ID</span>
+              <input
+                type="text"
+                value={form.testerId}
+                onChange={handleChange('testerId')}
+                placeholder="tester-golan-001"
+                style={inputStyle}
+              />
+            </label>
+
+            <label className="flex flex-col space-y-1 text-sm font-medium">
+              <span>STB IP</span>
+              <input
+                type="text"
+                value={form.stbIp}
+                onChange={handleChange('stbIp')}
+                placeholder="192.168.1.200"
+                style={inputStyle}
+              />
+            </label>
+
+            <label className="flex flex-col space-y-1 text-sm font-medium">
+              <span>API Key</span>
+              <input
+                type="password"
+                value={form.apiKey}
+                onChange={handleChange('apiKey')}
+                placeholder="X-QuickSet-Api-Key"
+                style={inputStyle}
+              />
+            </label>
+
+            <button
+              type="submit"
+              className="sidebar-item"
+              disabled={isSubmitting || sessionActive}
+            >
+              {isSubmitting ? 'Starting…' : sessionActive ? 'Scenario Active' : 'Start Test'}
+            </button>
+          </form>
+        </div>
+
+        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
+          <h3 className="text-lg font-semibold">Session Status</h3>
+          <dl className="grid grid-cols-1 gap-x-8 gap-y-2 text-sm sm:grid-cols-2">
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Session ID</dt>
+              <dd className="text-sm font-mono text-slate-100">
+                {runtimeSession?.session_id || sessionId || '—'}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Tester</dt>
+              <dd className="text-sm text-slate-100">
+                {runtimeSession?.tester_id || form.testerId || '—'}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">STB IP</dt>
+              <dd className="text-sm text-slate-100">
+                {runtimeSession?.stb_ip || form.stbIp || '—'}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Scenario</dt>
+              <dd className="text-sm text-slate-100">
+                {runtimeSession?.scenario_name || scenarioName}
+              </dd>
+            </div>
+            <div className="flex flex-col">
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Result</dt>
+              <dd className="text-sm text-slate-100">
+                <span className={getStatusClass(resultLabel)}>{resultLabel}</span>
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Started</dt>
+              <dd className="text-sm text-slate-100">{startedAt}</dd>
+            </div>
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Finished</dt>
+              <dd className="text-sm text-slate-100">{finishedAt}</dd>
+            </div>
+          </dl>
+
+          {runtimeSession?.infra_checks && runtimeSession.infra_checks.length > 0 && (
+            <div className="space-y-2">
+              <h4 className="text-sm font-semibold">Infra Checks</h4>
+              <ul className="infra-list space-y-1">
+                {runtimeSession.infra_checks.map((check) => (
+                  <li key={check.name}>
+                    <span>{check.name}</span>
+                    <span className={getInfraStatusClass(check.status)}>{check.status}</span>
+                    {check.message && <span className="hint"> · {check.message}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {pendingQuestion && (
+            <div className="space-y-2">
+              <h4 className="text-sm font-semibold">Pending Tester Input</h4>
+              <p className="hint">{pendingQuestion.prompt}</p>
+              {renderQuestionControls(pendingQuestion)}
+            </div>
+          )}
+        </div>
       </div>
 
-      <div className="card" style={{ marginBottom: 24 }}>
-        <h3>Session Status</h3>
-        <dl className="session-meta">
-          <div>
-            <dt>Session ID</dt>
-            <dd>{session?.session_id || sessionId || '—'}</dd>
-          </div>
-          <div>
-            <dt>Tester</dt>
-            <dd>{session?.tester_id || form.testerId || '—'}</dd>
-          </div>
-          <div>
-            <dt>STB IP</dt>
-            <dd>{session?.stb_ip || form.stbIp || '—'}</dd>
-          </div>
-          <div>
-            <dt>Scenario</dt>
-            <dd>{session?.scenario_name || scenarioName}</dd>
-          </div>
-          <div>
-            <dt>Result</dt>
-            <dd>
-              <span className={getStatusClass(resultLabel)}>{resultLabel}</span>
-            </dd>
-          </div>
-          <div>
-            <dt>Started</dt>
-            <dd>{startedAt}</dd>
-          </div>
-          <div>
-            <dt>Finished</dt>
-            <dd>{finishedAt}</dd>
-          </div>
-        </dl>
+      {/* SECOND ROW: Summary + Timeline */}
+      <div className="mt-10 grid grid-cols-1 gap-12 lg:grid-cols-2">
+        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
+          <h3 className="text-lg font-semibold">QuickSet Summary</h3>
+          {renderQuicksetSummary()}
+        </div>
 
-        {session?.infra_checks && session.infra_checks.length > 0 && (
-          <div style={{ marginTop: 16 }}>
-            <h4>Infra Checks</h4>
-            <ul className="infra-list">
-              {session.infra_checks.map((check) => (
-                <li key={check.name}>
-                  <span>{check.name}</span>
-                  <span className={getInfraStatusClass(check.status)}>{check.status}</span>
-                  {check.message && <span className="hint"> · {check.message}</span>}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {pendingQuestion && (
-          <div style={{ marginTop: 16 }}>
-            <h4>Pending Tester Input</h4>
-            <p className="hint" style={{ marginBottom: 8 }}>
-              {pendingQuestion.prompt}
-            </p>
-            {renderQuestionControls(pendingQuestion)}
-          </div>
-        )}
-      </div>
-
-      <div className="card" style={{ marginBottom: 24 }}>
-        <h3>QuickSet Summary</h3>
-        {renderQuicksetSummary()}
-      </div>
-
-      <div className="card" style={{ marginBottom: 24 }}>
-        <h3>Steps Timeline</h3>
-        <StepsTimeline
-          sessionId={sessionId}
-          rows={timelineForDisplay}
-          isLoading={timelineLoading}
-          error={timelineError}
-        />
+        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
+          <h3 className="text-lg font-semibold">Steps Timeline</h3>
+          <StepsTimeline sessionId={sessionId} rows={timelineForDisplay} />
+        </div>
       </div>
 
       {showLogs && (
         <>
-          <div className="card" style={{ marginBottom: 24 }}>
+          <div className="card w-full h-full px-10 py-8" style={{ marginBottom: 24 }}>
             <h3>ADB Logs</h3>
             <div className="adb-logs-container">
-              <pre className="adb-logs-text">{formatLogPreview(session?.logs?.adb)}</pre>
+              <pre className="adb-logs-text">
+                {formatLogPreview(runtimeSession?.logs?.adb)}
+              </pre>
             </div>
           </div>
 
-          <div className="card">
+          <div className="card w-full h-full px-10 py-8">
             <h3>Logcat Logs</h3>
             <div className="adb-logs-container">
-              <pre className="adb-logs-text">{formatLogPreview(session?.logs?.logcat)}</pre>
+              <pre className="adb-logs-text">
+                {formatLogPreview(runtimeSession?.logs?.logcat)}
+              </pre>
             </div>
           </div>
         </>
       )}
-    </section>
+    </div>
   );
 };
 

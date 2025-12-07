@@ -1,5 +1,6 @@
 import { apiGet, apiPost } from './httpClient';
-import type { QuickSetSession, SessionTimelineResponse } from '../types/domain';
+import type { QuickSetSession } from '../types/domain';
+import type { TvAutoSyncSessionResponse } from '../types/quickset';
 
 export interface RunScenarioParams {
   testerId: string;
@@ -30,8 +31,8 @@ export async function runScenario(params: RunScenarioParams): Promise<RunScenari
   );
 }
 
-export async function getSession(sessionId: string, apiKey: string): Promise<QuickSetSession> {
-  return apiGet<QuickSetSession>(`/api/quickset/sessions/${sessionId}`, undefined, {
+export async function getSession(sessionId: string, apiKey: string): Promise<TvAutoSyncSessionResponse> {
+  return apiGet<TvAutoSyncSessionResponse>(`/api/quickset/sessions/${sessionId}`, undefined, {
     headers: {
       'X-QuickSet-Api-Key': apiKey,
     },
@@ -48,8 +49,4 @@ export async function answerQuestion(sessionId: string, apiKey: string, answer: 
       },
     }
   );
-}
-
-export async function fetchSessionTimeline(sessionId: string): Promise<SessionTimelineResponse> {
-  return apiGet<SessionTimelineResponse>(`/api/sessions/${sessionId}`);
 }

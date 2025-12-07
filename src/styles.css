@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   --color-bg: #060712;
   --color-bg-elevated: #101223;
@@ -354,6 +358,72 @@ body {
   font-size: 12px;
   margin-bottom: 4px;
   opacity: 0.8;
+}
+
+/* ============================================
+ * QA Card Column Layout Law
+ * ============================================ */
+
+.qa-card {
+  overflow-x: hidden;
+  width: 100%;
+  max-width: 100%;
+}
+
+.qa-grid-4cols {
+  display: grid;
+  grid-template-columns:
+    minmax(18ch, 32ch)
+    minmax(10ch, 14ch)
+    minmax(22ch, 28ch)
+    minmax(26ch, 1fr);
+  column-gap: 3rem;
+}
+
+.qa-grid-4cols-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.qa-grid-4cols-row {
+  align-items: flex-start;
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.75rem;
+}
+
+.qa-grid-4cols-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.qa-col-text {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.qa-col-text-sm {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.qa-col-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+.qa-col-timestamp {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  text-align: right;
 }
 
 /* Text input to match the dark theme */

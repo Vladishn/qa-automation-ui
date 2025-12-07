@@ -142,39 +142,3 @@ export interface QuickSetSession {
   remote_keys?: string[];
   infra_checks?: QuickSetInfraCheck[];
 }
-
-export type TimelineStepStatus = 'INFO' | 'PASS' | 'FAIL' | 'AWAITING_INPUT';
-
-export type OverallStatus = 'PASS' | 'FAIL' | 'AWAITING_INPUT';
-
-export interface TimelineRow {
-  name: string;
-  label: string;
-  status: TimelineStepStatus;
-  timestamp?: string | null;
-  question?: string | null;
-  user_answer?: string | null;
-  details?: Record<string, unknown>;
-}
-
-export interface SessionSummary {
-  session_id: string;
-  scenario_name: string | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-  overall_status: OverallStatus;
-  brand_mismatch: boolean;
-  tv_brand_user?: string | null;
-  tv_brand_log?: string | null;
-  has_volume_issue: boolean;
-  has_osd_issue: boolean;
-  notes?: string | null;
-  analysis_text: string;
-  has_failure: boolean;
-}
-
-export interface SessionTimelineResponse {
-  session: SessionSummary;
-  timeline: TimelineRow[];
-  has_failure?: boolean;
-}

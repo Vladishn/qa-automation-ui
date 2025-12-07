@@ -1,7 +1,7 @@
 """Pydantic schemas describing backend payloads."""
 
 from datetime import datetime
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, Field
 
@@ -174,3 +174,50 @@ class QuickSetSession(BaseModel):
 
 class QuickSetAnswer(BaseModel):
     answer: str
+
+
+TvAutoSyncStatus = Literal["PASS", "FAIL", "INFO", "AWAITING_INPUT", "PENDING"]
+
+
+class TvAutoSyncTimelineEvent(BaseModel):
+    name: str
+    label: Optional[str] = None
+    status: TvAutoSyncStatus
+    timestamp: Optional[str] = None
+    question: Optional[str] = None
+    user_answer: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+    class Config:
+        extra = "allow"
+
+
+class TvAutoSyncSession(BaseModel):
+    session_id: str
+    scenario_name: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    overall_status: TvAutoSyncStatus
+    has_failure: bool
+    brand_mismatch: bool
+    tv_brand_user: Optional[str] = None
+    tv_brand_log: Optional[str] = None
+    has_volume_issue: bool
+    has_osd_issue: bool
+    analysis_text: Optional[str] = None
+    notes: Optional[str] = None
+    analyzer_ready: bool = False
+
+    class Config:
+        extra = "allow"
+
+
+class TvAutoSyncSessionResponse(BaseModel):
+    session: TvAutoSyncSession
+    timeline: List[TvAutoSyncTimelineEvent] = Field(default_factory=list)
+    has_failure: bool
+    quickset_session: Optional[Dict[str, Any]] = Field(None, alias="quickset_session")
+
+    class Config:
+        allow_population_by_field_name = True
+        extra = "allow"

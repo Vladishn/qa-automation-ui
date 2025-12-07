@@ -9,12 +9,17 @@ from datetime import datetime
 import re
 from pathlib import Path
 
+from .analyzers.base import AnalyzerResult, FailureInsight
+
 
 class StepStatus(str, Enum):
     INFO = "INFO"
     PASS = "PASS"
     FAIL = "FAIL"
     AWAITING_INPUT = "AWAITING_INPUT"
+
+
+MetricStatus = Literal["OK", "FAIL", "INCOMPATIBILITY", "NOT_EVALUATED"]
 
 
 WHITELISTED_STEPS = {
@@ -32,6 +37,86 @@ CRITICAL_STEPS = {
     "question_tv_osd_seen",
     "question_pairing_screen_seen",
     "question_tv_brand_ui",
+}
+
+ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
+    "tester_saw_no_volume_change": {
+        "category": "functional",
+        "severity": "high",
+        "title": "No TV volume change observed",
+        "default_description": "Tester did not observe TV volume change.",
+        "recommendations": [
+            "Ensure STB IR blaster is pointing directly at the TV.",
+            "Reduce distance between STB and TV.",
+        ],
+        "evidence_keys": ["volume_probe_state", "tv_volume_events"],
+    },
+    "tester_saw_no_osd": {
+        "category": "functional",
+        "severity": "high",
+        "title": "TV OSD not seen",
+        "default_description": "Tester did not observe TV OSD.",
+        "recommendations": [
+            "Ensure STB IR blaster is pointing at the TV.",
+            "Retry Auto-Sync after adjusting IR alignment.",
+        ],
+        "evidence_keys": ["tv_osd_events"],
+    },
+    "volume_probe_inconclusive": {
+        "category": "functional",
+        "severity": "medium",
+        "title": "Volume probe inconclusive",
+        "default_description": "Volume probe returned UNKNOWN; no evidence of TV control.",
+        "recommendations": [
+            "Reduce distance between STB and TV.",
+            "Retry TV auto-sync after adjusting IR alignment.",
+        ],
+        "evidence_keys": ["volume_probe_state"],
+    },
+    "ir_no_effect": {
+        "category": "device",
+        "severity": "high",
+        "title": "IR commands produced no TV response",
+        "default_description": "No TV response to IR commands was detected.",
+        "recommendations": [
+            "Ensure STB IR blaster is pointing directly at the TV.",
+            "Retry Auto-Sync after adjusting IR alignment.",
+        ],
+        "evidence_keys": ["ir_commands_sent", "tv_volume_events", "tv_osd_events"],
+    },
+    "ruleset_ok_but_no_control": {
+        "category": "integration",
+        "severity": "medium",
+        "title": "Ruleset succeeded but control missing",
+        "default_description": "QuickSet ruleset reported success, but no TV control was confirmed.",
+        "recommendations": [
+            "Re-run TV auto-sync after verifying IR alignment.",
+            "Check hotel mode.",
+        ],
+        "evidence_keys": ["tv_volume_events", "tv_osd_events"],
+    },
+    "cec_inactive": {
+        "category": "integration",
+        "severity": "medium",
+        "title": "HDMI-CEC inactive",
+        "default_description": "HDMI-CEC events were not detected; CEC might be disabled.",
+        "recommendations": [
+            "Enable HDMI-CEC on the TV.",
+        ],
+        "evidence_keys": ["cec_events_detected"],
+    },
+    "no_tv_response": {
+        "category": "functional",
+        "severity": "critical",
+        "title": "No TV responses observed",
+        "default_description": "Tester reported no TV responses and logs lacked TV control evidence.",
+        "recommendations": [
+            "Ensure STB IR blaster is pointing directly at the TV.",
+            "Reduce distance between STB and TV.",
+            "Retry Auto-Sync after adjusting IR alignment.",
+        ],
+        "evidence_keys": ["tv_volume_events", "tv_osd_events"],
+    },
 }
 
 TV_AUTO_SYNC_MARKERS = {
@@ -83,6 +168,8 @@ VOLUME_SIGNAL_KEYS = (
     "osd_source",
 )
 
+VOLUME_PROBE_ISSUE_STATES = {"UNKNOWN", "NONE", "NO_TV_CONTROL", "STB"}
+
 
 @dataclass
 class SnapshotState:
@@ -129,6 +216,9 @@ class SessionSummary:
     notes: Optional[str]
     analysis_text: str
     has_failure: bool
+    brand_status: MetricStatus
+    volume_status: MetricStatus
+    osd_status: MetricStatus
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -145,6 +235,9 @@ class LogEvidence:
     volume_source: Optional[str] = None
     log_brand: Optional[str] = None
     log_text: str = ""
+    ir_commands_sent: bool = False
+    cec_events_detected: bool = False
+    cec_inactive: bool = False
 
 
 def load_logcat_text(session_id: str) -> str:
@@ -220,6 +313,23 @@ def analyze_log_evidence(
         "stb osd",
         "volume panel stb",
     ))
+    evidence.ir_commands_sent = any(keyword in lower for keyword in (
+        "sendir",
+        "sending ir",
+        "ir command",
+        "ir-blaster",
+        "ir blaster",
+        "ir tx",
+    ))
+    evidence.cec_events_detected = bool(
+        re.search(r"\bcec[_-]?event\b", lower)
+        or "hdmi-cec" in lower
+        or re.search(r"\bcec:\b", lower)
+        or re.search(r"\bcec\b", lower)
+    )
+    evidence.cec_inactive = bool(
+        re.search(r"cec (?:inactive|disabled|off|not available)", lower)
+    )
     evidence.volume_source = _detect_volume_source(log_text)
     log_brand_text = _detect_brand_from_log_text(log_text)
     evidence.log_brand = log_brand_text or default_brand
@@ -309,7 +419,7 @@ def build_timeline_and_summary(
         log_evidence=log_evidence,
     )
 
-    summary = _build_session_summary(
+    summary, analyzer_result = _build_session_summary(
         session_id=session_id,
         scenario_name=resolved_scenario_name,
         raw_events=raw_events,
@@ -319,10 +429,21 @@ def build_timeline_and_summary(
         log_evidence=log_evidence,
     )
 
+    summary_dict = summary.to_dict()
+    analysis_result_payload = analyzer_result.model_dump(mode="json")
+    analysis_result_payload.update(
+        {
+            "brand_status": summary.brand_status,
+            "volume_status": summary.volume_status,
+            "osd_status": summary.osd_status,
+        }
+    )
+
     return {
-        "session": summary.to_dict(),
+        "session": summary_dict,
         "timeline": [row.to_dict() for row in timeline_rows],
         "has_failure": summary.has_failure,
+        "analysis_result": analysis_result_payload,
     }
 
 
@@ -569,6 +690,15 @@ def _normalize_probe_source(value: Any) -> Optional[str]:
     return "UNKNOWN"
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _event_has_volume_signal(details: Dict[str, Any]) -> bool:
     for key in VOLUME_SIGNAL_KEYS:
         if key not in details:
@@ -635,6 +765,7 @@ def _extract_volume_probe(
     if not latest_event:
         raw_answer: Optional[str] = None
         fallback_source = None
+        confidence = None
     else:
         raw_answer = (
             latest_details.get("answer")
@@ -644,6 +775,11 @@ def _extract_volume_probe(
         if raw_answer is not None:
             raw_answer = str(raw_answer).strip() or None
         fallback_source = _extract_source_from_details(latest_details)
+        confidence = _safe_float(
+            latest_details.get("confidence")
+            or latest_details.get("probability")
+            or latest_details.get("score")
+        )
 
     source = source_from_logs or fallback_source
     if source:
@@ -658,6 +794,7 @@ def _extract_volume_probe(
         "evidence": evidence_from_logs,
         "detection_state": detection_state,
         "detection_reason": detection_reason,
+        "confidence": confidence,
     }
 
 
@@ -754,7 +891,12 @@ def _apply_volume_changed(row: StepRow) -> None:
     if not ans:
         row.status = StepStatus.AWAITING_INPUT
         return
-    row.status = StepStatus.PASS
+    if ans in YES_ANSWERS:
+        row.status = StepStatus.PASS
+    elif ans in NO_ANSWERS:
+        row.status = StepStatus.FAIL
+    else:
+        row.status = StepStatus.PASS
 
 
 def _apply_osd(row: StepRow) -> None:
@@ -762,7 +904,12 @@ def _apply_osd(row: StepRow) -> None:
     if not ans:
         row.status = StepStatus.AWAITING_INPUT
         return
-    row.status = StepStatus.PASS
+    if ans in YES_ANSWERS:
+        row.status = StepStatus.PASS
+    elif ans in NO_ANSWERS:
+        row.status = StepStatus.FAIL
+    else:
+        row.status = StepStatus.PASS
 
 
 def _apply_pairing(row: StepRow) -> None:
@@ -846,6 +993,59 @@ def _answer_flags(row: Optional[StepRow]) -> tuple[bool, bool]:
     return ans in YES_ANSWERS, ans in NO_ANSWERS
 
 
+def _normalized_answer(row: Optional[StepRow]) -> str:
+    if not row or not row.user_answer:
+        return ""
+    return str(row.user_answer).strip().lower()
+
+
+def _tester_issue_from_row(row: Optional[StepRow]) -> Optional[bool]:
+    if not row:
+        return None
+    if row.status == StepStatus.FAIL:
+        return True
+    if row.status == StepStatus.PASS:
+        return False
+    return None
+
+
+def _combine_metric_status(
+    analyzer_issue: Optional[bool],
+    tester_issue: Optional[bool],
+) -> MetricStatus:
+    if analyzer_issue is None:
+        return "NOT_EVALUATED"
+    if analyzer_issue is False:
+        if tester_issue is None or tester_issue is False:
+            return "OK"
+        return "INCOMPATIBILITY"
+    if tester_issue is None or tester_issue is True:
+        return "FAIL"
+    return "INCOMPATIBILITY"
+
+
+def _has_tv_control_evidence(
+    volume_row: Optional[StepRow],
+    osd_row: Optional[StepRow],
+    log_evidence: LogEvidence,
+) -> bool:
+    for row in (volume_row, osd_row):
+        if not row:
+            continue
+        detection_state = str(row.details.get("volume_probe_detection_state") or "").strip().lower()
+        if detection_state == "tv_control":
+            return True
+        source = str(row.details.get("volume_probe_source") or "").strip().upper()
+        if source == "TV":
+            return True
+    volume_source = str(log_evidence.volume_source or "").strip().upper()
+    if volume_source == "TV":
+        return True
+    if log_evidence.osd_tv:
+        return True
+    return False
+
+
 def _flag_probe_issue(
     row: Optional[StepRow],
     reason: str,
@@ -878,6 +1078,8 @@ def _apply_volume_probe_to_rows(
         osd_row.details["volume_probe_source"] = volume_probe.get("source")
         osd_row.details["volume_probe_changed"] = volume_probe.get("changed")
         osd_row.details["volume_probe_detection_state"] = volume_probe.get("detection_state")
+        if volume_probe.get("confidence") is not None:
+            osd_row.details["volume_probe_confidence"] = volume_probe.get("confidence")
         if volume_probe.get("detection_reason"):
             osd_row.details["volume_probe_detection_reason"] = volume_probe.get("detection_reason")
         evidence = volume_probe.get("evidence")
@@ -889,6 +1091,8 @@ def _apply_volume_probe_to_rows(
         volume_row.details["volume_probe_source"] = volume_probe.get("source")
         volume_row.details["volume_probe_changed"] = volume_probe.get("changed")
         volume_row.details["volume_probe_detection_state"] = volume_probe.get("detection_state")
+        if volume_probe.get("confidence") is not None:
+            volume_row.details["volume_probe_confidence"] = volume_probe.get("confidence")
         if volume_probe.get("detection_reason"):
             volume_row.details["volume_probe_detection_reason"] = volume_probe.get("detection_reason")
 
@@ -956,6 +1160,168 @@ def _compute_overall_status(rows: List[StepRow]) -> StepStatus:
     return StepStatus.PASS
 
 
+def _collect_probe_state(volume_row: Optional[StepRow], log_evidence: LogEvidence) -> tuple[str, float]:
+    if volume_row:
+        detection_state_raw = str(volume_row.details.get("volume_probe_detection_state") or "").strip().upper()
+        source_raw = str(volume_row.details.get("volume_probe_source") or "").strip().upper()
+        confidence_raw = _safe_float(volume_row.details.get("volume_probe_confidence"))
+    else:
+        detection_state_raw = ""
+        source_raw = ""
+        confidence_raw = None
+
+    detection_state = detection_state_raw
+    if detection_state == "TV_CONTROL":
+        detection_state = "TV"
+    elif detection_state == "STB_CONTROL":
+        detection_state = "STB"
+    elif detection_state in {"UNKNOWN", "NONE"}:
+        detection_state = "UNKNOWN"
+
+    if source_raw in {"TV", "STB", "UNKNOWN"}:
+        source = source_raw
+    else:
+        source = ""
+
+    fallback = str(log_evidence.volume_source or "").strip().upper()
+    if fallback and fallback not in {"TV", "STB"}:
+        fallback = ""
+
+    state = detection_state or source or fallback or "UNKNOWN"
+    confidence = confidence_raw if confidence_raw is not None else 0.0
+    return state, confidence
+
+
+def _add_root_cause(
+    root_causes: List[FailureInsight],
+    recommendations: List[str],
+    code: str,
+    description: str,
+) -> None:
+    if not code or not description:
+        return
+    if any(item.code == code for item in root_causes):
+        return
+    meta = ROOT_CAUSE_METADATA.get(
+        code,
+        {
+            "category": "functional",
+            "severity": "medium",
+            "title": description,
+            "default_description": description,
+            "recommendations": [],
+            "evidence_keys": [],
+        },
+    )
+    insight = FailureInsight(
+        code=code,
+        category=meta.get("category", "functional"),
+        severity=meta.get("severity", "medium"),
+        title=meta.get("title", description),
+        description=description or meta.get("default_description", description),
+        evidence_keys=meta.get("evidence_keys", []),
+    )
+    root_causes.append(insight)
+    for rec in meta.get("recommendations", []):
+        if rec not in recommendations:
+            recommendations.append(rec)
+
+
+def _build_analysis_details(
+    *,
+    volume_row: Optional[StepRow],
+    osd_row: Optional[StepRow],
+    log_evidence: LogEvidence,
+    tv_brand_detected: Optional[str],
+    tv_control_evidence: bool,
+    missing_tv_responses: bool,
+    volume_yes: bool,
+    volume_no: bool,
+    osd_yes: bool,
+    osd_no: bool,
+    has_volume_issue: bool,
+    has_osd_issue: bool,
+    final_autosync_success: bool,
+) -> Tuple[List[FailureInsight], Dict[str, Any], List[str], str]:
+    root_causes: List[FailureInsight] = []
+    recs: List[str] = []
+    probe_state, probe_confidence = _collect_probe_state(volume_row, log_evidence)
+
+    if volume_no:
+        _add_root_cause(root_causes, recs, "tester_saw_no_volume_change", "Tester did not observe TV volume change.")
+    if osd_no:
+        _add_root_cause(root_causes, recs, "tester_saw_no_osd", "Tester did not observe TV OSD.")
+
+    probe_inconclusive = (probe_state in {"UNKNOWN", "NONE"} or not probe_state) and not tv_control_evidence
+    if probe_inconclusive:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "volume_probe_inconclusive",
+            "Volume probe returned UNKNOWN; no evidence of TV control.",
+        )
+
+    if missing_tv_responses:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "no_tv_response",
+            "Tester reported no TV responses and logs lacked TV control evidence.",
+        )
+
+    if log_evidence.ir_commands_sent and missing_tv_responses:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "ir_no_effect",
+            "No TV response to IR commands was detected.",
+        )
+
+    if log_evidence.autosync_success and not final_autosync_success:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "ruleset_ok_but_no_control",
+            "QuickSet ruleset reported success, but no TV control was confirmed.",
+        )
+
+    if log_evidence.cec_inactive:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "cec_inactive",
+            "HDMI-CEC events were not detected; CEC might be disabled.",
+        )
+
+    evidence_block = {
+        "tv_brand_detected": tv_brand_detected,
+        "ir_commands_sent": log_evidence.ir_commands_sent,
+        "cec_events_detected": log_evidence.cec_events_detected,
+        "tv_osd_events": log_evidence.osd_tv,
+        "tv_volume_events": tv_control_evidence,
+        "volume_probe_state": probe_state or "UNKNOWN",
+        "volume_probe_confidence": probe_confidence,
+    }
+
+    contradiction_detected = any(
+        bool(row and row.details.get("issue_confirmed_by_probe")) for row in (volume_row, osd_row)
+    )
+    volume_detection_state = str(volume_row.details.get("volume_probe_detection_state") or "").strip().lower() if volume_row else ""
+    if volume_detection_state == "stb_control" or (log_evidence.volume_source or "").upper() == "STB":
+        contradiction_detected = True
+
+    if contradiction_detected:
+        confidence = "high"
+    elif missing_tv_responses:
+        confidence = "low"
+    elif has_volume_issue or has_osd_issue:
+        confidence = "medium"
+    else:
+        confidence = "high"
+
+    return root_causes, evidence_block, recs, confidence
+
+
 def _build_session_summary(
     session_id: str,
     scenario_name: str,
@@ -964,7 +1330,7 @@ def _build_session_summary(
     log_brand: Optional[str],
     missing_critical: set[str],
     log_evidence: LogEvidence,
-) -> SessionSummary:
+) -> Tuple[SessionSummary, AnalyzerResult]:
     started_at, finished_at = _extract_session_times(raw_events)
 
     summary_row = next(
@@ -987,6 +1353,24 @@ def _build_session_summary(
         (r for r in timeline_rows if r.name == "question_notes"),
         None,
     )
+    volume_answer = _normalized_answer(volume_row)
+    osd_answer = _normalized_answer(osd_row)
+    volume_yes = volume_answer in YES_ANSWERS
+    volume_no = volume_answer in NO_ANSWERS
+    osd_yes = osd_answer in YES_ANSWERS
+    osd_no = osd_answer in NO_ANSWERS
+    tv_control_evidence = _has_tv_control_evidence(volume_row, osd_row, log_evidence)
+    missing_tv_responses = volume_no and osd_no and not tv_control_evidence
+    probe_state, _ = _collect_probe_state(volume_row, log_evidence)
+    normalized_probe_state = (probe_state or "").strip().upper() or "UNKNOWN"
+
+    analyzer_volume_issue_raw = (not tv_control_evidence) or (normalized_probe_state in VOLUME_PROBE_ISSUE_STATES)
+    analyzer_osd_issue_raw = (not log_evidence.osd_tv)
+    brand_mismatch_raw = bool(brand_row and brand_row.details.get("brand_mismatch"))
+
+    tester_brand_issue = _tester_issue_from_row(brand_row)
+    tester_volume_issue = _tester_issue_from_row(volume_row)
+    tester_osd_issue = _tester_issue_from_row(osd_row)
 
     failed_steps = [
         row.name
@@ -1002,17 +1386,27 @@ def _build_session_summary(
             }
         )
     )
-    any_fail = bool(failed_steps)
     any_await = bool(awaiting_steps)
     final_stage = summary_row is not None
 
-    brand_mismatch = bool(brand_row and brand_row.details.get("brand_mismatch"))
+    analyzer_ready = final_stage and not any_await
+
+    analyzer_brand_issue = brand_mismatch_raw if analyzer_ready else None
+    analyzer_volume_issue = analyzer_volume_issue_raw if analyzer_ready else None
+    analyzer_osd_issue = analyzer_osd_issue_raw if analyzer_ready else None
+
+    brand_status = _combine_metric_status(analyzer_brand_issue, tester_brand_issue)
+    volume_status = _combine_metric_status(analyzer_volume_issue, tester_volume_issue)
+    osd_status = _combine_metric_status(analyzer_osd_issue, tester_osd_issue)
+
+    brand_mismatch = bool(analyzer_brand_issue)
+    has_volume_issue = bool(analyzer_volume_issue)
+    has_osd_issue = bool(analyzer_osd_issue)
+
     tv_brand_user = brand_row.details.get("tv_brand_user") if brand_row else None
     tv_brand_log = (
         brand_row.details.get("tv_brand_log") if brand_row else log_brand
     )
-    has_volume_issue = bool(volume_row and volume_row.status == StepStatus.FAIL)
-    has_osd_issue = bool(osd_row and osd_row.status == StepStatus.FAIL)
 
     if final_stage and not log_evidence.autosync_started:
         overall = StepStatus.FAIL
@@ -1020,13 +1414,17 @@ def _build_session_summary(
     elif final_stage and log_evidence.autosync_started and not log_evidence.autosync_success:
         overall = StepStatus.FAIL
         analysis_text = "TV auto-sync failed: auto-sync did not complete successfully in logs."
-    elif any_await:
+    elif not analyzer_ready:
         overall = StepStatus.AWAITING_INPUT
         analysis_text = "TV auto-sync in progress – awaiting tester input."
-    elif any_fail:
+    elif brand_mismatch or has_volume_issue or has_osd_issue:
         overall = StepStatus.FAIL
         if brand_mismatch:
             analysis_text = "TV auto-sync failed: TV brand seen by tester does not match logs."
+        elif missing_tv_responses:
+            analysis_text = "TV auto-sync failed: no TV responses observed (no volume change, no TV OSD)."
+        elif has_volume_issue and has_osd_issue:
+            analysis_text = "TV auto-sync failed: TV volume and OSD did not match expectations."
         elif has_volume_issue:
             analysis_text = "TV auto-sync failed: TV volume/behavior did not match expectations."
         elif has_osd_issue:
@@ -1037,16 +1435,60 @@ def _build_session_summary(
         overall = StepStatus.PASS
         analysis_text = "TV auto-sync completed successfully with no detected issues."
 
+    positive_volume_signal = volume_yes and not has_volume_issue
+    positive_osd_signal = osd_yes and not has_osd_issue
+    final_autosync_success = (
+        log_evidence.autosync_started
+        and log_evidence.autosync_success
+        and positive_volume_signal
+        and positive_osd_signal
+        and not brand_mismatch
+    )
+
+    failure_insights, evidence_block, recs, confidence = _build_analysis_details(
+        volume_row=volume_row,
+        osd_row=osd_row,
+        log_evidence=log_evidence,
+        tv_brand_detected=tv_brand_log or tv_brand_user or log_evidence.log_brand,
+        tv_control_evidence=tv_control_evidence,
+        missing_tv_responses=missing_tv_responses,
+        volume_yes=volume_yes,
+        volume_no=volume_no,
+        osd_yes=osd_yes,
+        osd_no=osd_no,
+        has_volume_issue=has_volume_issue,
+        has_osd_issue=has_osd_issue,
+        final_autosync_success=final_autosync_success,
+    )
+
+    has_failure = overall == StepStatus.FAIL
+
+    analyzer_result = AnalyzerResult(
+        overall_status=overall.value,
+        has_failure=has_failure,
+        failed_steps=failed_steps,
+        awaiting_steps=awaiting_steps,
+        analysis_text=analysis_text,
+        failure_insights=failure_insights,
+        evidence=evidence_block,
+        recommendations=recs,
+        confidence=confidence,
+    )
+
     if summary_row:
         summary_row.status = overall
         summary_row.details["analysis"] = analysis_text
         summary_row.details["failed_steps"] = failed_steps
         summary_row.details["awaiting_steps"] = awaiting_steps
         summary_row.details["autosync_started"] = log_evidence.autosync_started
-        summary_row.details["autosync_success"] = log_evidence.autosync_success
+        summary_row.details["autosync_success"] = final_autosync_success
+        summary_row.details["failure_insights"] = [ins.model_dump(mode="json") for ins in failure_insights]
+        summary_row.details["evidence"] = evidence_block
+        summary_row.details["recommendations"] = recs
+        summary_row.details["confidence"] = confidence
+        summary_row.details["confidence_level"] = confidence
 
-    has_failure = overall == StepStatus.FAIL
-    return SessionSummary(
+    session_summary = SessionSummary(
         session_id=session_id,
         scenario_name=scenario_name,
         started_at=started_at,
@@ -1060,4 +1502,9 @@ def _build_session_summary(
         notes=notes_row.user_answer if notes_row else None,
         analysis_text=analysis_text,
         has_failure=has_failure,
+        brand_status=brand_status,
+        volume_status=volume_status,
+        osd_status=osd_status,
     )
+
+    return session_summary, analyzer_result

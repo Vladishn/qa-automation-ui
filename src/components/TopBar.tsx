@@ -1,8 +1,6 @@
 import React, { CSSProperties, useEffect, useState } from 'react';
 
-type BackendStatus = 'unknown' | 'ok' | 'down';
-
-const HEALTH_ENDPOINT = 'http://localhost:8000/health';
+type BackendStatus = 'UP' | 'DOWN';
 
 const backendStatusBaseStyle: CSSProperties = {
   marginLeft: '12px',
@@ -17,57 +15,64 @@ const backendStatusBaseStyle: CSSProperties = {
 };
 
 const backendStatusVariants: Record<BackendStatus, CSSProperties> = {
-  unknown: {
-    color: 'var(--color-text-muted)',
-    background: 'rgba(255, 255, 255, 0.05)',
-    opacity: 0.8,
-  },
-  ok: {
+  UP: {
     color: '#2ecc71',
     background: 'rgba(46, 204, 113, 0.15)',
   },
-  down: {
+  DOWN: {
     color: '#e74c3c',
     background: 'rgba(231, 76, 60, 0.15)',
   },
 };
 
 const TopBar: React.FC = () => {
-  const [backendStatus, setBackendStatus] = useState<BackendStatus>('unknown');
-  const [lastChecked, setLastChecked] = useState<Date | null>(null);
-  const [lastError, setLastError] = useState<string | null>(null);
+  const [backendStatus, setBackendStatus] = useState<BackendStatus>('DOWN');
 
   useEffect(() => {
     let isMounted = true;
 
-    const checkHealth = async () => {
+    const resolveBaseUrl = () => {
       try {
-        const response = await fetch(HEALTH_ENDPOINT);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const data: { status?: string } = await response.json();
-        if (data?.status === 'ok') {
-          if (isMounted) {
-            setBackendStatus('ok');
-            setLastError(null);
-            setLastChecked(new Date());
-          }
+        // @ts-ignore
+        if (typeof API_BASE_URL !== 'undefined') return API_BASE_URL;
+      } catch {}
+      try {
+        // @ts-ignore
+        if (typeof apiBaseUrl !== 'undefined') return apiBaseUrl;
+      } catch {}
+      return (
+        import.meta.env.VITE_QUICKSET_API_BASE_URL ??
+        import.meta.env.VITE_API_BASE_URL ??
+        'http://localhost:8000'
+      );
+    };
+
+    const baseUrl = resolveBaseUrl();
+    const url = `${baseUrl}/health`;
+
+    const checkHealth = async () => {
+      if (!isMounted) return;
+
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+        });
+
+        if (!isMounted) return;
+
+        if (res.ok) {
+          setBackendStatus('UP');
         } else {
-          throw new Error('Unexpected response payload');
+          setBackendStatus('DOWN');
         }
-      } catch (error) {
-        console.error('[BackendHealth]', error);
-        if (isMounted) {
-          setBackendStatus('down');
-          setLastError(error instanceof Error ? error.message : 'Unknown error');
-          setLastChecked(new Date());
-        }
+      } catch (error: any) {
+        if (!isMounted) return;
+        setBackendStatus('DOWN');
       }
     };
 
     checkHealth();
-    const intervalId = window.setInterval(checkHealth, 30_000);
+    const intervalId = window.setInterval(checkHealth, 15_000);
 
     return () => {
       isMounted = false;
@@ -75,15 +80,12 @@ const TopBar: React.FC = () => {
     };
   }, []);
 
-  const tooltip = lastChecked
-    ? `Last checked: ${lastChecked.toLocaleTimeString()}${lastError ? `\nError: ${lastError}` : ''}`
-    : 'Backend status not checked yet';
-
-  const statusLabel = backendStatus === 'ok' ? 'OK' : backendStatus === 'down' ? 'DOWN' : '...';
+  const backendBadgeClass = `backend-status backend-status--${backendStatus} `;
   const statusStyle: CSSProperties = {
     ...backendStatusBaseStyle,
     ...backendStatusVariants[backendStatus],
   };
+  const statusText = backendStatus === 'UP' ? 'Backend: UP' : 'Backend: DOWN';
 
   return (
     <header className="top-bar">
@@ -103,8 +105,8 @@ const TopBar: React.FC = () => {
           <option>Env: STAGE</option>
           <option>Env: PROD</option>
         </select>
-        <span className={`backend-status backend-status--${backendStatus}`} style={statusStyle} title={tooltip}>
-          Backend: {statusLabel}
+        <span className={backendBadgeClass.trim()} style={statusStyle}>
+          {statusText}
         </span>
       </div>
     </header>

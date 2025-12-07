@@ -17,10 +17,18 @@ from ..config import settings
 from ..models import (
     QuickSetInfraCheck,
     QuickSetQuestion,
-    QuickSetSession,
+    QuickSetSession as QuickSetRuntimeSession,
     QuickSetStep,
 )
+from ..quickset_timeline_analyzer import build_timeline_and_summary
+from ..regression_snapshots import save_session_snapshot
+from ..schemas import (
+    TvAutoSyncSession,
+    TvAutoSyncSessionResponse,
+    TvAutoSyncTimelineEvent,
+)
 from ..storage import quickset_session_store
+from ..timeline_loader import load_session_events
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -97,23 +105,44 @@ def run_scenario(
     return RunScenarioResponse(session_id=session.session_id, scenario_name=session.scenario_name)
 
 
-@router.get("/sessions/{session_id}", response_model=QuickSetSession)
+@router.get("/sessions/{session_id}", response_model=TvAutoSyncSessionResponse)
 def get_session(
     session_id: str,
     api_key: str = Depends(require_api_key),
-) -> QuickSetSession:
+) -> TvAutoSyncSessionResponse:
     session = quickset_session_store.get_session(session_id)
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
-    return compute_session_decision(session)
+    dto, _ = _build_tv_autosync_envelope(session, include_runtime=True)
+    return dto
 
 
-@router.post("/sessions/{session_id}/answer", response_model=QuickSetSession)
+@router.get("/sessions/{session_id}/snapshot")
+def get_quickset_session_snapshot(session_id: str) -> Dict[str, Any]:
+    """
+    Export a full JSON snapshot for the given QuickSet session_id and
+    persist it as a regression artifact for later diffing.
+    """
+    session = quickset_session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
+
+    dto, analyzer_ready = _build_tv_autosync_envelope(session, include_runtime=False)
+    if not analyzer_ready:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Analyzer data not available for snapshot")
+
+    data = dto.model_dump(mode="json", by_alias=True)
+    artifact_path = save_session_snapshot(session_id, data)
+    data["artifact_path"] = artifact_path
+    return data
+
+
+@router.post("/sessions/{session_id}/answer", response_model=TvAutoSyncSessionResponse)
 def answer_question(
     session_id: str,
     payload: QuickSetAnswer,
     api_key: str = Depends(require_api_key),
-) -> QuickSetSession:
+) -> TvAutoSyncSessionResponse:
     session = quickset_session_store.get_session(session_id)
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
@@ -122,7 +151,109 @@ def answer_question(
 
     quickset_session_store.deliver_answer(session_id, payload.answer)
     updated = quickset_session_store.get_session(session_id)
-    return compute_session_decision(updated if updated else session)
+    runtime_session = updated if updated else session
+    dto, _ = _build_tv_autosync_envelope(runtime_session, include_runtime=True)
+    return dto
+
+
+def _build_tv_autosync_envelope(
+    session: QuickSetRuntimeSession,
+    *,
+    include_runtime: bool,
+) -> Tuple[TvAutoSyncSessionResponse, bool]:
+    analyzer_payload = _load_analyzer_payload(session.session_id, session.scenario_name)
+    analyzer_ready = False
+
+    if analyzer_payload:
+        raw_summary = TvAutoSyncSession(**analyzer_payload["session"])
+        timeline = [
+            TvAutoSyncTimelineEvent(**row)
+            for row in analyzer_payload.get("timeline", [])
+        ]
+        analysis_result = analyzer_payload.get("analysis_result")
+        if analysis_result:
+            _inject_analysis_details(timeline, analysis_result)
+        has_failure = bool(analyzer_payload.get("has_failure", raw_summary.has_failure))
+        analyzer_ready = _is_analyzer_ready(raw_summary, timeline)
+        awaiting_tester_input = _is_awaiting_input(session, raw_summary)
+        if awaiting_tester_input:
+            pending_text = raw_summary.analysis_text or "TV auto-sync in progress – awaiting tester input."
+            summary = raw_summary.model_copy(
+                update={
+                    "overall_status": "PENDING",
+                    "has_failure": False,
+                    "analysis_text": pending_text,
+                    "analyzer_ready": False,
+                }
+            )
+            has_failure = False
+            analyzer_ready = False
+        else:
+            summary = raw_summary.model_copy(update={"analyzer_ready": analyzer_ready})
+    else:
+        summary = _build_pending_summary(session)
+        timeline = []
+        has_failure = summary.has_failure
+
+    runtime_dump = session.model_dump(mode="json", by_alias=True) if include_runtime else None
+    dto = TvAutoSyncSessionResponse(
+        session=summary,
+        timeline=timeline,
+        has_failure=has_failure,
+        quickset_session=runtime_dump,
+    )
+    return dto, analyzer_ready
+
+
+def _load_analyzer_payload(session_id: str, scenario_name: Optional[str]) -> Optional[Dict[str, Any]]:
+    events = load_session_events(session_id)
+    if not events:
+        return None
+    resolved = scenario_name or "UNKNOWN"
+    return build_timeline_and_summary(
+        session_id=session_id,
+        scenario_name=resolved,
+        raw_events=events,
+    )
+
+
+def _build_pending_summary(session: QuickSetRuntimeSession) -> TvAutoSyncSession:
+    running = session.state != "completed"
+    analysis = "Analyzer is still running."
+    if running:
+        analysis = "Session is still running. Analyzer will start shortly."
+    return TvAutoSyncSession(
+        session_id=session.session_id,
+        scenario_name=session.scenario_name,
+        started_at=_to_iso(session.start_time),
+        finished_at=_to_iso(session.end_time),
+        overall_status="PENDING",
+        has_failure=False,
+        brand_mismatch=False,
+        tv_brand_user=None,
+        tv_brand_log=None,
+        has_volume_issue=False,
+        has_osd_issue=False,
+        analysis_text=analysis,
+        notes=None,
+        analyzer_ready=False,
+    )
+
+
+def _is_analyzer_ready(summary: TvAutoSyncSession, timeline: List[TvAutoSyncTimelineEvent]) -> bool:
+    if summary.overall_status in {"PASS", "FAIL"}:
+        return True
+    return any(row.name == "analysis_summary" and row.status in {"PASS", "FAIL"} for row in timeline)
+
+
+def _is_awaiting_input(session: QuickSetRuntimeSession, summary: TvAutoSyncSession) -> bool:
+    return session.state == "awaiting_input" or summary.overall_status == "AWAITING_INPUT"
+
+
+def _to_iso(value: Optional[datetime]) -> Optional[str]:
+    if not value:
+        return None
+    return value.isoformat()
 
 
 def ask_via_session(
@@ -184,6 +315,30 @@ def _resolve_input_kind(question_id: str) -> tuple[str, list[str] | None]:
     if question_id in TEXT_QUESTION_IDS:
         return "text", None
     return "text", None
+
+
+def _inject_analysis_details(
+    timeline: List[TvAutoSyncTimelineEvent],
+    analysis_result: Dict[str, Any],
+) -> None:
+    summary_row = next((row for row in timeline if row.name == "analysis_summary"), None)
+    if not summary_row:
+        return
+    details = dict(summary_row.details or {})
+    failure_insights = analysis_result.get("failure_insights")
+    evidence = analysis_result.get("evidence")
+    recommendations = analysis_result.get("recommendations")
+    confidence = analysis_result.get("confidence")
+    if failure_insights:
+        details["failure_insights"] = failure_insights
+    if evidence:
+        details["evidence"] = evidence
+    if recommendations:
+        details["recommendations"] = recommendations
+    if confidence:
+        details["confidence"] = confidence
+        details["confidence_level"] = confidence
+    summary_row.details = details
 
 
 def _make_ask(session_id: str, step_logger: QuickSetStepLogger):
@@ -361,7 +516,7 @@ def _extract_remote_keys(log_text: str) -> List[str]:
     return detected
 
 
-def compute_session_decision(session: QuickSetSession) -> QuickSetSession:
+def compute_session_decision(session: QuickSetRuntimeSession) -> QuickSetRuntimeSession:
     if session.state != "completed":
         return session
 
@@ -393,7 +548,7 @@ def compute_session_decision(session: QuickSetSession) -> QuickSetSession:
 
 
 def _collect_session_evidence(
-    session: QuickSetSession,
+    session: QuickSetRuntimeSession,
 ) -> Tuple[Optional[str], Optional[dict], Optional[dict], Optional[dict], Optional[dict]]:
     log_meta = _extract_latest_metadata(session.steps, "log_analysis_complete")
     log_state = None

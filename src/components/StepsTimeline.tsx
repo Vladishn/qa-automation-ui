@@ -1,5 +1,6 @@
 import React from 'react';
-import type { TimelineRow, TimelineStepStatus } from '../types/domain';
+import type { AnalyzerStepStatus, MetricTriState, TvAutoSyncTimelineEvent } from '../types/quickset';
+import { formatTriStateLabel } from '../logic/quicksetMetrics';
 import './StepsTimeline.css';
 
 interface Props {
@@ -9,18 +10,38 @@ interface Props {
   error?: string | null;
 }
 
-const statusClass = (status: TimelineStepStatus): string => {
+type TimelineStatus = AnalyzerStepStatus | MetricTriState;
+type TimelineRow = TvAutoSyncTimelineEvent & { statusDisplay?: TimelineStatus };
+
+const warningPillStyle: React.CSSProperties = {
+  background: 'rgba(251, 191, 36, 0.18)',
+  color: '#fbbf24'
+};
+
+const statusClass = (status: TimelineStatus): string => {
   switch (status) {
+    case 'OK':
     case 'PASS':
       return 'status-pill status-pill--pass';
     case 'FAIL':
       return 'status-pill status-pill--fail';
+    case 'INCOMPATIBILITY':
+      return 'status-pill status-pill--info';
+    case 'PENDING':
     case 'AWAITING_INPUT':
       return 'status-pill status-pill--running';
+    case 'NOT_EVALUATED':
+      return 'status-pill status-pill--info';
     default:
       return 'status-pill status-pill--info';
   }
 };
+
+const isTriStateStatus = (value: TimelineStatus): value is MetricTriState =>
+  value === 'OK' || value === 'FAIL' || value === 'INCOMPATIBILITY' || value === 'NOT_EVALUATED';
+
+const formatStatusText = (status: TimelineStatus): string =>
+  isTriStateStatus(status) ? formatTriStateLabel(status) : status;
 
 const buildInfo = (row: TimelineRow): string => {
   const parts: string[] = [];
@@ -83,31 +104,44 @@ const StepsTimeline: React.FC<Props> = ({ sessionId, rows, isLoading, error }) =
 
   return (
     <div className="steps-timeline-container">
-      <div className="steps-timeline-scroll">
-        <table className="steps-timeline-table">
-          <thead>
-            <tr>
-              <th className="steps-timeline-col-step">Step</th>
-              <th className="steps-timeline-col-status">Status</th>
-              <th className="steps-timeline-col-timestamp">Timestamp</th>
-              <th className="steps-timeline-col-info">Info</th>
-            </tr>
-          </thead>
-          <tbody>
-            {timelineRows.map((row, index) => (
-              <tr key={`${row.name}-${row.timestamp ?? index}`}>
-                <td className="steps-timeline-col-step">{row.label || row.name}</td>
-                <td className="steps-timeline-col-status">
-                  <span className={statusClass(row.status)}>{row.status}</span>
-                </td>
-                <td className="steps-timeline-col-timestamp">
-                  {row.timestamp ? new Date(row.timestamp).toLocaleString() : '—'}
-                </td>
-                <td className="steps-timeline-col-info">{buildInfo(row)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="space-y-3 text-sm">
+        <div className={`qa-grid-4cols qa-grid-4cols-header px-6`}>
+          <div className="text-left">Step</div>
+          <div className="text-center">Status</div>
+          <div className="text-right">Timestamp</div>
+          <div className="text-left">Info</div>
+        </div>
+
+        <div className="mt-3 space-y-1">
+          {timelineRows.map((row, index) => {
+            const key = `${row.name}-${row.timestamp ?? index}`;
+            const label = row.label || row.name;
+            const timestampText = row.timestamp ? new Date(row.timestamp).toLocaleString() : '—';
+            const infoText = buildInfo(row);
+
+            const displayStatus = (row.statusDisplay ?? row.status) as TimelineStatus;
+            const pillLabel = formatStatusText(displayStatus);
+            const pillStyle = displayStatus === 'INCOMPATIBILITY' ? warningPillStyle : undefined;
+
+            return (
+              <div
+                key={key}
+                className={`qa-grid-4cols qa-grid-4cols-row px-6`}
+              >
+                <div className="qa-col-text">{label}</div>
+                <div className="flex justify-center">
+                  <span className="qa-col-pill">
+                    <span className={statusClass(displayStatus)} style={pillStyle}>
+                      {pillLabel}
+                    </span>
+                  </span>
+                </div>
+                <div className="qa-col-timestamp">{timestampText}</div>
+                <div className="qa-col-text-sm">{infoText}</div>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
