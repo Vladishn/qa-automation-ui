@@ -2,9 +2,14 @@ import React, { useEffect, useMemo, useState } from 'react';
 import StepsTimeline from '../components/StepsTimeline';
 import QuicksetSessionSummary from '../components/QuicksetSessionSummary';
 import type { QuickSetQuestion } from '../types/domain';
-import type { MetricTriState, QuicksetAnalysisDetails, TvAutoSyncTimelineEvent } from '../types/quickset';
+import type {
+  MetricTriState,
+  QuicksetAnalysisDetails,
+  TvAutoSyncTimelineEvent,
+  TvAutoSyncSession
+} from '../types/quickset';
 import { deriveUiStatusFromAnalyzer } from '../logic/quicksetStatus';
-import { deriveMetricStatuses } from '../logic/quicksetMetrics';
+import { deriveMetricStatuses, type MetricStatusesResult } from '../logic/quicksetMetrics';
 import { runScenario, answerQuestion } from '../services/quicksetService';
 import { useSessionPolling } from '../hooks/useSessionPolling';
 
@@ -15,7 +20,7 @@ const defaultForm = {
 };
 
 const scenarioOptions = [{ value: 'TV_AUTO_SYNC' as const, label: 'TV Auto Sync' }];
-type TimelineRowWithStatus = TvAutoSyncTimelineEvent & { statusDisplay?: MetricTriState };
+type TimelineRowWithStatus = TvAutoSyncTimelineEvent & { statusDisplay?: AnalyzerStepStatus | MetricTriState };
 
 const formatDateTime = (value?: string | null): string => {
   if (!value) return '—';
@@ -56,6 +61,13 @@ const getInfraStatusClass = (status: string): string => {
   if (normalized === 'OK') return 'status-pill status-pill--pass';
   if (normalized === 'FAIL') return 'status-pill status-pill--fail';
   return 'status-pill status-pill--info';
+};
+
+const pickTriState = (value: unknown): MetricTriState | undefined => {
+  if (value === 'OK' || value === 'FAIL' || value === 'INCOMPATIBILITY' || value === 'NOT_EVALUATED') {
+    return value;
+  }
+  return undefined;
 };
 
 const QuickSetRunner: React.FC = () => {
@@ -130,35 +142,23 @@ const QuickSetRunner: React.FC = () => {
     () => (analysisSummaryRow ? (analysisSummaryRow.details as QuicksetAnalysisDetails) : undefined),
     [analysisSummaryRow]
   );
-  const metricStatuses = useMemo(
-    () => (analyzerSession ? deriveMetricStatuses(analyzerSession, analysisDetails) : null),
-    [analyzerSession, analysisDetails]
-  );
-  const timelineForDisplay = useMemo<TimelineRowWithStatus[] | null>(() => {
+  const metricStatuses = useMemo<MetricStatusesResult | null>(() => {
     if (!analyzerSession) {
       return null;
     }
-    if (!metricStatuses) {
-      return timeline;
-    }
-    return timeline.map((row) => {
-      let statusDisplay: MetricTriState | undefined;
-      switch (row.name) {
-        case 'question_tv_volume_changed':
-          statusDisplay = metricStatuses.volumeStatus;
-          break;
-        case 'question_tv_osd_seen':
-          statusDisplay = metricStatuses.osdStatus;
-          break;
-        case 'question_tv_brand_ui':
-          statusDisplay = metricStatuses.brandStatus;
-          break;
-        default:
-          break;
-      }
-      return statusDisplay ? { ...row, statusDisplay } : row;
-    });
-  }, [analyzerSession, metricStatuses, timeline]);
+    const derived = deriveMetricStatuses(analyzerSession, analysisDetails);
+    return {
+      ...derived,
+      brandStatus: pickTriState(analyzerSession.brand_status) ?? derived.brandStatus,
+      volumeStatus: pickTriState(analyzerSession.volume_status) ?? derived.volumeStatus,
+      osdStatus: pickTriState(analyzerSession.osd_status) ?? derived.osdStatus,
+      hasBrandMismatch:
+        typeof analyzerSession.brand_mismatch === 'boolean'
+          ? analyzerSession.brand_mismatch
+          : derived.hasBrandMismatch
+    };
+  }, [analyzerSession, analysisDetails]);
+  const timelineForDisplay: TimelineRowWithStatus[] | null = timeline ?? null;
 
   const submitAnswer = async (value: string) => {
     if (!sessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {

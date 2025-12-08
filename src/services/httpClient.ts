@@ -67,7 +67,6 @@ export async function apiGet<T>(
  * Centralized API error logger.
  */
 export function logApiError(source: string, error: unknown): void {
-  // eslint-disable-next-line no-console
   console.error(`[API ERROR] ${source}`, error);
 }
 

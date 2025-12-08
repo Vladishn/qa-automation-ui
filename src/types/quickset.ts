@@ -20,6 +20,13 @@ export interface QuicksetAnalysisDetails {
   evidence?: Record<string, unknown>;
   recommendations?: string[];
   confidence?: 'low' | 'medium' | 'high';
+  tester_verdict?: string;
+  log_verdict?: string;
+  telemetry_state?: string;
+  conflict_tester_vs_logs?: boolean;
+  log_failure_reason?: string | null;
+  autosync_started?: boolean;
+  autosync_success?: boolean;
   [key: string]: unknown;
 }
 
@@ -35,6 +42,9 @@ export interface TvAutoSyncSession {
   tv_brand_log?: string | null;
   has_volume_issue: boolean;
   has_osd_issue: boolean;
+  brand_status?: MetricTriState;
+  volume_status?: MetricTriState;
+  osd_status?: MetricTriState;
   analysis_text?: string | null;
   notes?: string | null;
   analyzer_ready?: boolean;

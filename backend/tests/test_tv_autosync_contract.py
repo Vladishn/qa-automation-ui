@@ -135,10 +135,16 @@ def test_tv_autosync_contract(scenario_key: str, contract: Dict[str, Any]) -> No
     expected_steps = scenario_cfg["expected_steps"]
 
     # 1. load events + answers from artifacts
-    raw_events, user_answers = load_session_artifacts(session_id)
+    raw_events, _ = load_session_artifacts(session_id)
 
     # 2. run analyzer exactly like the router does
-    session_summary, timeline = build_timeline_and_summary(raw_events, user_answers)
+    payload = build_timeline_and_summary(
+        session_id=session_id,
+        scenario_name=expected_summary["scenario_name"],
+        raw_events=raw_events,
+    )
+    session_summary = payload["session"]
+    timeline = payload["timeline"]
 
     # 3. assert summary contract
     assert session_summary["scenario_name"] == expected_summary["scenario_name"]

@@ -132,6 +132,36 @@ const renderMetricPill = (descriptor: StatusDescriptor) => (
   </span>
 );
 
+const asTriState = (value: unknown): MetricTriState | undefined => {
+  if (value === 'OK' || value === 'FAIL' || value === 'INCOMPATIBILITY' || value === 'NOT_EVALUATED') {
+    return value;
+  }
+  return undefined;
+};
+
+const timelineStepByName = (timeline: TvAutoSyncTimelineEvent[], name: string) =>
+  timeline.find((row) => row.name === name);
+
+const formatAnswerLabel = (row?: TvAutoSyncTimelineEvent | null): string => {
+  if (!row) {
+    return 'UNKNOWN';
+  }
+  const answer = row.user_answer ?? (row.details?.answer as string | undefined);
+  if (!answer) {
+    return 'UNKNOWN';
+  }
+  return answer.toUpperCase();
+};
+
+const telemetryEvidenceKeys: string[] = [
+  'tv_volume_events',
+  'tv_osd_events',
+  'volume_probe_state',
+  'volume_probe_confidence',
+  'volume_probe_detection_state',
+  'issue_confirmed_by_probe'
+];
+
 const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStatuses }) => {
   const scenarioTitle = session.scenario_name && session.scenario_name !== 'UNKNOWN'
     ? session.scenario_name
@@ -142,35 +172,77 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
     analyzerUi.status === 'pass' ? 'PASS' : analyzerUi.status === 'fail' ? 'FAIL' : 'AWAITING_INPUT';
   const badgeLabel = analyzerUi.label;
 
-  const analysisSummaryRow = timeline.find((row) => row.name === 'analysis_summary');
+  const analysisSummaryRow = timelineStepByName(timeline, 'analysis_summary');
   const analysisDetails: QuicksetAnalysisDetails | undefined = analysisSummaryRow
     ? (analysisSummaryRow.details as QuicksetAnalysisDetails)
     : undefined;
-  const metrics = (metricStatuses ?? deriveMetricStatuses(session, analysisDetails)) as MetricStatusesResult;
+  const derivedMetrics = deriveMetricStatuses(session, analysisDetails);
+  const metrics: MetricStatusesResult =
+    metricStatuses ??
+    {
+      ...derivedMetrics,
+      brandStatus: asTriState(session.brand_status) ?? derivedMetrics.brandStatus,
+      volumeStatus: asTriState(session.volume_status) ?? derivedMetrics.volumeStatus,
+      osdStatus: asTriState(session.osd_status) ?? derivedMetrics.osdStatus,
+      hasBrandMismatch:
+        typeof session.brand_mismatch === 'boolean' ? session.brand_mismatch : derivedMetrics.hasBrandMismatch
+    };
   const analyzerReady = metrics.analyzerReady;
   const { brandStatus: brandTriState, volumeStatus: volumeTriState, osdStatus: osdTriState } = metrics;
+
+  const volumeStep = timelineStepByName(timeline, 'question_tv_volume_changed');
+  const osdStep = timelineStepByName(timeline, 'question_tv_osd_seen');
+  const pairingStep = timelineStepByName(timeline, 'question_pairing_screen_seen');
+  const brandStep = timelineStepByName(timeline, 'question_tv_brand_ui');
 
   const volumeTile = deriveVolumeTileState(session, timeline);
   const osdTile = deriveOsdTileState(session, timeline);
 
   const failureInsights: FailureInsight[] = analysisDetails?.failure_insights ?? [];
-  const evidence = analysisDetails?.evidence;
+  const analysisEvidence = analysisDetails?.evidence as Record<string, unknown> | undefined;
   const recommendations = analysisDetails?.recommendations ?? [];
   const legacyConfidence = (analysisDetails as { confidence_level?: 'low' | 'medium' | 'high' } | undefined)
     ?.confidence_level;
   const confidence = analysisDetails?.confidence ?? legacyConfidence;
   const hasInsights = failureInsights.length > 0;
-  const hasEvidence = Boolean(evidence && Object.keys(evidence).length);
+  const hasEvidence = Boolean(analysisEvidence && Object.keys(analysisEvidence).length);
   const hasRecommendations = recommendations.length > 0;
   const shouldRenderDiagnostics = hasInsights || hasEvidence || hasRecommendations || Boolean(confidence);
+
+  const testerSignals = [
+    { label: 'Volume changed', value: formatAnswerLabel(volumeStep) },
+    { label: 'TV OSD seen', value: formatAnswerLabel(osdStep) },
+    { label: 'Pairing screen', value: formatAnswerLabel(pairingStep) },
+    { label: 'Brand (UI)', value: formatAnswerLabel(brandStep) }
+  ];
+
+  const testerVerdict = (analysisDetails?.tester_verdict as string | undefined) ?? 'UNKNOWN';
+  const logVerdict = (analysisDetails?.log_verdict as string | undefined) ?? 'UNKNOWN';
+  const telemetryState = (analysisDetails?.telemetry_state as string | undefined) ?? 'UNKNOWN';
+  const logFailureReason =
+    typeof analysisDetails?.log_failure_reason === 'string' && analysisDetails.log_failure_reason.length
+      ? analysisDetails.log_failure_reason
+      : null;
+  const autosyncStarted = analysisDetails?.autosync_started;
+  const autosyncSuccess = analysisDetails?.autosync_success;
+  const conflictDetected = Boolean(analysisDetails?.conflict_tester_vs_logs);
+  const telemetryWarning = !conflictDetected && logVerdict === 'INCONCLUSIVE';
+  const conflictDetails =
+    logFailureReason || analysisDetails?.analysis || session.analysis_text || 'Logs contradict tester answers.';
+  const evidenceHighlights = telemetryEvidenceKeys
+    .map((key) => ({
+      key,
+      value: analysisEvidence ? analysisEvidence[key] : undefined
+    }))
+    .filter((item) => item.value !== undefined);
 
   const brandStatus: StatusDescriptor = (() => {
     const brandLabel = formatTriStateLabel(brandTriState);
     if (brandTriState === 'FAIL') {
       // FAIL should not occur for brand, but fall back to mismatch copy.
       const mismatchDetail =
-        metrics.preferredUserBrand && metrics.preferredLogBrand
-          ? `Tester saw ${metrics.preferredUserBrand}, logs show ${metrics.preferredLogBrand}.`
+        session.tv_brand_user && session.tv_brand_log
+          ? `Tester saw ${session.tv_brand_user}, logs show ${session.tv_brand_log}.`
           : 'Brand mismatch detected between UI and logs.';
       return { label: brandLabel, variant: 'danger', detail: mismatchDetail };
     }
@@ -178,7 +250,10 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
       return {
         label: brandLabel,
         variant: 'warning',
-        detail: 'Analyzer and tester disagree on brand. Analyzer sees mismatch in logs.'
+        detail:
+          session.tv_brand_user && session.tv_brand_log
+            ? `Tester saw ${session.tv_brand_user}, logs show ${session.tv_brand_log}.`
+            : 'Analyzer and tester disagree on brand. Analyzer sees mismatch in logs.'
       };
     }
     if (brandTriState === 'OK') {
@@ -237,6 +312,81 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
         </div>
       </div>
 
+      <div className="qs-summary-sections">
+        <section className="qs-summary-section">
+          <h4 className="metric-label">TESTER SIGNALS</h4>
+          <div className="qs-summary-dl">
+            <div>
+              <span className="qs-summary-dt">Overall tester verdict</span>
+              <span className="qs-summary-dd">{testerVerdict}</span>
+            </div>
+            {testerSignals.map((signal) => (
+              <div key={signal.label}>
+                <span className="qs-summary-dt">{signal.label}</span>
+                <span className="qs-summary-dd">{signal.value}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="qs-summary-section">
+          <h4 className="metric-label">LOGS & TELEMETRY</h4>
+          <div className="qs-summary-dl">
+            <div>
+              <span className="qs-summary-dt">Log verdict</span>
+              <span className="qs-summary-dd">{logVerdict}</span>
+            </div>
+            <div>
+              <span className="qs-summary-dt">Telemetry state</span>
+              <span className="qs-summary-dd">{telemetryState}</span>
+            </div>
+            {autosyncStarted !== undefined && (
+              <div>
+                <span className="qs-summary-dt">Auto-sync started</span>
+                <span className="qs-summary-dd">{String(autosyncStarted)}</span>
+              </div>
+            )}
+            {autosyncSuccess !== undefined && (
+              <div>
+                <span className="qs-summary-dt">Auto-sync success</span>
+                <span className="qs-summary-dd">{String(autosyncSuccess)}</span>
+              </div>
+            )}
+            {logFailureReason && (
+              <div>
+                <span className="qs-summary-dt">Log note</span>
+                <span className="qs-summary-dd">{logFailureReason}</span>
+              </div>
+            )}
+            {evidenceHighlights.length > 0 && (
+              <div>
+                <span className="qs-summary-dt">Evidence</span>
+                <span className="qs-summary-dd">
+                  <ul className="qs-summary-evidence">
+                    {evidenceHighlights.map((item) => (
+                      <li key={item.key}>
+                        <strong>{item.key}:</strong> {String(item.value)}
+                      </li>
+                    ))}
+                  </ul>
+                </span>
+              </div>
+            )}
+          </div>
+          {conflictDetected && (
+            <div className="qs-summary-conflict">
+              <strong>Conflict detected: Tester vs logs/telemetry</strong>
+              <p>{conflictDetails}</p>
+            </div>
+          )}
+          {telemetryWarning && (
+            <div className="qs-summary-warning">
+              Logs/telemetry inconclusive; relying on tester answers for overall verdict.
+            </div>
+          )}
+        </section>
+      </div>
+
       {testerNotes && (
         <div className="qs-summary-notes">
           <h4 className="metric-label">NOTES</h4>
@@ -260,13 +410,13 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
             </section>
           )}
 
-          {hasEvidence && evidence && (
+          {hasEvidence && analysisEvidence && (
             <section className="qs-diagnostic-section">
               <details>
                 <summary>Evidence</summary>
                 <table className="qs-evidence-table">
                   <tbody>
-                    {Object.entries(evidence).map(([key, value]) => (
+                    {Object.entries(analysisEvidence).map(([key, value]) => (
                       <tr key={key}>
                         <th>{key}</th>
                         <td>{typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}</td>

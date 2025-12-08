@@ -365,19 +365,21 @@ body {
  * ============================================ */
 
 .qa-card {
-  overflow-x: hidden;
+  overflow: hidden;
   width: 100%;
   max-width: 100%;
+  position: relative;
 }
 
 .qa-grid-4cols {
   display: grid;
   grid-template-columns:
-    minmax(18ch, 32ch)
+    minmax(16ch, 28ch)
     minmax(10ch, 14ch)
-    minmax(22ch, 28ch)
-    minmax(26ch, 1fr);
-  column-gap: 3rem;
+    minmax(20ch, 26ch)
+    minmax(24ch, 1fr);
+  column-gap: 2.5rem;
+  margin-left: auto;
 }
 
 .qa-grid-4cols-header {
@@ -386,6 +388,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: rgba(255, 255, 255, 0.6);
+  text-align: right;
 }
 
 .qa-grid-4cols-row {
@@ -403,6 +406,7 @@ body {
   line-height: 1.5;
   white-space: normal;
   word-break: break-word;
+  text-align: right;
 }
 
 .qa-col-text-sm {
@@ -410,6 +414,7 @@ body {
   line-height: 1.5;
   white-space: normal;
   word-break: break-word;
+  text-align: right;
 }
 
 .qa-col-pill {

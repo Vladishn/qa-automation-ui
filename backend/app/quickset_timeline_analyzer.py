@@ -20,6 +20,8 @@ class StepStatus(str, Enum):
 
 
 MetricStatus = Literal["OK", "FAIL", "INCOMPATIBILITY", "NOT_EVALUATED"]
+TelemetryState = Literal["TV_CONTROL", "STB_CONTROL_CONFIDENT", "UNKNOWN"]
+PROBE_CONFIDENCE_CONFIDENT = 0.7
 
 
 WHITELISTED_STEPS = {
@@ -63,7 +65,7 @@ ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
         "evidence_keys": ["tv_osd_events"],
     },
     "volume_probe_inconclusive": {
-        "category": "functional",
+        "category": "tooling",
         "severity": "medium",
         "title": "Volume probe inconclusive",
         "default_description": "Volume probe returned UNKNOWN; no evidence of TV control.",
@@ -116,6 +118,48 @@ ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
             "Retry Auto-Sync after adjusting IR alignment.",
         ],
         "evidence_keys": ["tv_volume_events", "tv_osd_events"],
+    },
+    "probe_detected_stb_control": {
+        "category": "functional",
+        "severity": "high",
+        "title": "Probe detected STB control",
+        "default_description": "Telemetry probe indicates STB controls volume/OSD despite tester reporting TV control.",
+        "recommendations": [
+            "Verify TV remote pairing and ensure TV volume control is enabled.",
+            "Re-run TV auto-sync to confirm TV control.",
+        ],
+        "evidence_keys": ["volume_probe_state", "volume_probe_confidence"],
+    },
+    "brand_mismatch_detected": {
+        "category": "integration",
+        "severity": "medium",
+        "title": "Brand mismatch between tester and logs",
+        "default_description": "Tester reported a different TV brand than logs detected.",
+        "recommendations": [
+            "Re-run TV auto-sync and verify TV brand selection.",
+        ],
+        "evidence_keys": ["tv_brand_detected"],
+    },
+    "autosync_not_started": {
+        "category": "functional",
+        "severity": "high",
+        "title": "TV auto-sync not triggered",
+        "default_description": "QuickSet logs do not show TV auto-sync starting.",
+        "recommendations": [
+            "Restart the TV auto-sync flow from the STB.",
+            "Verify connectivity between the STB and QuickSet services.",
+        ],
+        "evidence_keys": [],
+    },
+    "autosync_not_completed": {
+        "category": "functional",
+        "severity": "high",
+        "title": "TV auto-sync did not complete",
+        "default_description": "QuickSet logs show TV auto-sync started but not completed successfully.",
+        "recommendations": [
+            "Retry TV auto-sync and review QuickSet error logs.",
+        ],
+        "evidence_keys": [],
     },
 }
 
@@ -1046,6 +1090,52 @@ def _has_tv_control_evidence(
     return False
 
 
+def _derive_telemetry_state(
+    *,
+    tv_control_evidence: bool,
+    log_evidence: LogEvidence,
+    normalized_probe_state: str,
+    probe_confidence: float,
+) -> TelemetryState:
+    if (
+        tv_control_evidence
+        or normalized_probe_state == "TV"
+        or log_evidence.osd_tv
+        or log_evidence.cec_events_detected
+        or (log_evidence.volume_source or "").strip().upper() == "TV"
+    ):
+        return "TV_CONTROL"
+    strong_probe_negative = (
+        normalized_probe_state in {"STB", "NO_TV_CONTROL"}
+        and probe_confidence >= PROBE_CONFIDENCE_CONFIDENT
+    ) or (log_evidence.osd_stb and probe_confidence >= PROBE_CONFIDENCE_CONFIDENT)
+    if strong_probe_negative:
+        return "STB_CONTROL_CONFIDENT"
+    return "UNKNOWN"
+
+
+def _resolve_metric_status_from_tester(
+    *,
+    tester_yes: bool,
+    tester_no: bool,
+    telemetry_state: TelemetryState,
+    analyzer_ready: bool,
+) -> tuple[MetricStatus, bool]:
+    if not analyzer_ready:
+        return "NOT_EVALUATED", False
+    if tester_no:
+        return "FAIL", True
+    if telemetry_state == "STB_CONTROL_CONFIDENT":
+        return "INCOMPATIBILITY", True
+    if tester_yes:
+        if telemetry_state == "UNKNOWN":
+            return "INCOMPATIBILITY", False
+        return "OK", False
+    if telemetry_state == "UNKNOWN":
+        return "INCOMPATIBILITY", False
+    return "OK", False
+
+
 def _flag_probe_issue(
     row: Optional[StepRow],
     reason: str,
@@ -1063,6 +1153,54 @@ def _flag_probe_issue(
     else:
         row.details["probe_mismatch_reason"] = reason
     row.details["issue_confirmed_by_probe"] = True
+
+
+def _annotate_probe_note(row: Optional[StepRow], message: str, *, confirmed: bool = False) -> None:
+    if not row or not message:
+        return
+    existing = row.details.get("probe_mismatch_reason")
+    if existing:
+        row.details["probe_mismatch_reason"] = f"{existing}; {message}"
+    else:
+        row.details["probe_mismatch_reason"] = message
+    if confirmed:
+        row.details["issue_confirmed_by_probe"] = True
+
+
+def _apply_axis_timeline_status(
+    row: Optional[StepRow],
+    *,
+    axis_label: str,
+    tester_no: bool,
+    telemetry_state: TelemetryState,
+    analyzer_ready: bool,
+    probe_confidence: float,
+) -> None:
+    if not row or not analyzer_ready:
+        return
+    if tester_no:
+        row.status = StepStatus.FAIL
+        return
+    if telemetry_state == "STB_CONTROL_CONFIDENT":
+        row.status = StepStatus.FAIL
+        confidence_text = f"{probe_confidence:.2f}".rstrip("0").rstrip(".")
+        reason = (
+            f"Probe indicates STB controls {axis_label.lower()} (confidence {confidence_text})."
+            if probe_confidence
+            else f"Probe indicates STB controls {axis_label.lower()}."
+        )
+        _annotate_probe_note(row, reason, confirmed=True)
+    elif telemetry_state == "UNKNOWN":
+        row.status = StepStatus.INFO
+        _annotate_probe_note(
+            row,
+            f"Telemetry inconclusive for {axis_label.lower()}; no TV control evidence detected.",
+            confirmed=False,
+        )
+    else:
+        row.status = StepStatus.PASS
+        if "probe_mismatch_reason" in row.details and not tester_no:
+            row.details.pop("probe_mismatch_reason", None)
 
 
 def _apply_volume_probe_to_rows(
@@ -1175,6 +1313,8 @@ def _collect_probe_state(volume_row: Optional[StepRow], log_evidence: LogEvidenc
         detection_state = "TV"
     elif detection_state == "STB_CONTROL":
         detection_state = "STB"
+    elif detection_state == "NO_TV_CONTROL":
+        detection_state = "NO_TV_CONTROL"
     elif detection_state in {"UNKNOWN", "NONE"}:
         detection_state = "UNKNOWN"
 
@@ -1190,6 +1330,57 @@ def _collect_probe_state(volume_row: Optional[StepRow], log_evidence: LogEvidenc
     state = detection_state or source or fallback or "UNKNOWN"
     confidence = confidence_raw if confidence_raw is not None else 0.0
     return state, confidence
+
+
+def _volume_probe_metadata_present(row: Optional[StepRow]) -> bool:
+    if not row:
+        return False
+    for key in ("volume_probe_state", "volume_probe_source", "volume_probe_detection_state", "volume_probe_confidence"):
+        if key not in row.details:
+            continue
+        value = row.details.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        else:
+            return True
+    return False
+
+
+def _timeline_has_probe_event(raw_events: List[Dict[str, Any]], timeline_rows: List[StepRow]) -> bool:
+    probe_names = {name.lower() for name in PROBE_EVENT_NAMES}
+    for row in timeline_rows:
+        if row.name.lower() in probe_names:
+            return True
+    for event in raw_events:
+        step_name = str(event.get("step_name") or "").strip().lower()
+        if step_name in probe_names:
+            return True
+    return False
+
+
+def _has_autosync_signal(
+    *,
+    tv_brand_log: Optional[str],
+    log_evidence: LogEvidence,
+    volume_row: Optional[StepRow],
+    tv_control_evidence: bool,
+    raw_events: List[Dict[str, Any]],
+    timeline_rows: List[StepRow],
+) -> bool:
+    if tv_brand_log or log_evidence.log_brand:
+        return True
+    if _volume_probe_metadata_present(volume_row):
+        return True
+    if log_evidence.volume_source:
+        return True
+    if tv_control_evidence or log_evidence.osd_tv or log_evidence.osd_stb:
+        return True
+    if _timeline_has_probe_event(raw_events, timeline_rows):
+        return True
+    return False
 
 
 def _add_root_cause(
@@ -1242,6 +1433,10 @@ def _build_analysis_details(
     has_volume_issue: bool,
     has_osd_issue: bool,
     final_autosync_success: bool,
+    telemetry_state: TelemetryState,
+    brand_mismatch: bool,
+    autosync_never_started: bool,
+    autosync_failed: bool,
 ) -> Tuple[List[FailureInsight], Dict[str, Any], List[str], str]:
     root_causes: List[FailureInsight] = []
     recs: List[str] = []
@@ -1292,6 +1487,37 @@ def _build_analysis_details(
             "cec_inactive",
             "HDMI-CEC events were not detected; CEC might be disabled.",
         )
+    if autosync_never_started:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "autosync_not_started",
+            "QuickSet logs did not show TV auto-sync starting.",
+        )
+    if autosync_failed and not autosync_never_started:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "autosync_not_completed",
+            "QuickSet logs show TV auto-sync started but not completed successfully.",
+        )
+    if telemetry_state == "STB_CONTROL_CONFIDENT":
+        reason = "Probe indicates STB controls volume/OSD despite tester confirmation."
+        if log_evidence.volume_source:
+            reason = f"Probe indicates {log_evidence.volume_source} controls volume/OSD despite tester confirmation."
+        _add_root_cause(
+            root_causes,
+            recs,
+            "probe_detected_stb_control",
+            reason,
+        )
+    if brand_mismatch:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "brand_mismatch_detected",
+            "Tester brand does not match logs.",
+        )
 
     evidence_block = {
         "tv_brand_detected": tv_brand_detected,
@@ -1333,50 +1559,36 @@ def _build_session_summary(
 ) -> Tuple[SessionSummary, AnalyzerResult]:
     started_at, finished_at = _extract_session_times(raw_events)
 
-    summary_row = next(
-        (r for r in timeline_rows if r.name == "analysis_summary"),
-        None,
-    )
-    brand_row = next(
-        (r for r in timeline_rows if r.name == "question_tv_brand_ui"),
-        None,
-    )
-    volume_row = next(
-        (r for r in timeline_rows if r.name == "question_tv_volume_changed"),
-        None,
-    )
-    osd_row = next(
-        (r for r in timeline_rows if r.name == "question_tv_osd_seen"),
-        None,
-    )
-    notes_row = next(
-        (r for r in timeline_rows if r.name == "question_notes"),
-        None,
-    )
+    summary_row = next((r for r in timeline_rows if r.name == "analysis_summary"), None)
+    brand_row = next((r for r in timeline_rows if r.name == "question_tv_brand_ui"), None)
+    volume_row = next((r for r in timeline_rows if r.name == "question_tv_volume_changed"), None)
+    osd_row = next((r for r in timeline_rows if r.name == "question_tv_osd_seen"), None)
+    pairing_row = next((r for r in timeline_rows if r.name == "question_pairing_screen_seen"), None)
+    notes_row = next((r for r in timeline_rows if r.name == "question_notes"), None)
     volume_answer = _normalized_answer(volume_row)
     osd_answer = _normalized_answer(osd_row)
     volume_yes = volume_answer in YES_ANSWERS
     volume_no = volume_answer in NO_ANSWERS
     osd_yes = osd_answer in YES_ANSWERS
     osd_no = osd_answer in NO_ANSWERS
+    pairing_answer = _normalized_answer(pairing_row)
+    pairing_yes = pairing_answer in YES_ANSWERS
+    pairing_no = pairing_answer in NO_ANSWERS
     tv_control_evidence = _has_tv_control_evidence(volume_row, osd_row, log_evidence)
     missing_tv_responses = volume_no and osd_no and not tv_control_evidence
-    probe_state, _ = _collect_probe_state(volume_row, log_evidence)
+    probe_state, probe_confidence = _collect_probe_state(volume_row, log_evidence)
     normalized_probe_state = (probe_state or "").strip().upper() or "UNKNOWN"
+    telemetry_state = _derive_telemetry_state(
+        tv_control_evidence=tv_control_evidence,
+        log_evidence=log_evidence,
+        normalized_probe_state=normalized_probe_state,
+        probe_confidence=probe_confidence,
+    )
 
-    analyzer_volume_issue_raw = (not tv_control_evidence) or (normalized_probe_state in VOLUME_PROBE_ISSUE_STATES)
-    analyzer_osd_issue_raw = (not log_evidence.osd_tv)
     brand_mismatch_raw = bool(brand_row and brand_row.details.get("brand_mismatch"))
 
     tester_brand_issue = _tester_issue_from_row(brand_row)
-    tester_volume_issue = _tester_issue_from_row(volume_row)
-    tester_osd_issue = _tester_issue_from_row(osd_row)
 
-    failed_steps = [
-        row.name
-        for row in timeline_rows
-        if row.name in CRITICAL_STEPS and row.status == StepStatus.FAIL
-    ]
     awaiting_steps = sorted(
         set(missing_critical).union(
             {
@@ -1392,48 +1604,133 @@ def _build_session_summary(
     analyzer_ready = final_stage and not any_await
 
     analyzer_brand_issue = brand_mismatch_raw if analyzer_ready else None
-    analyzer_volume_issue = analyzer_volume_issue_raw if analyzer_ready else None
-    analyzer_osd_issue = analyzer_osd_issue_raw if analyzer_ready else None
 
     brand_status = _combine_metric_status(analyzer_brand_issue, tester_brand_issue)
-    volume_status = _combine_metric_status(analyzer_volume_issue, tester_volume_issue)
-    osd_status = _combine_metric_status(analyzer_osd_issue, tester_osd_issue)
+    volume_status, has_volume_issue = _resolve_metric_status_from_tester(
+        tester_yes=volume_yes,
+        tester_no=volume_no,
+        telemetry_state=telemetry_state,
+        analyzer_ready=analyzer_ready,
+    )
+    osd_status, has_osd_issue = _resolve_metric_status_from_tester(
+        tester_yes=osd_yes,
+        tester_no=osd_no,
+        telemetry_state=telemetry_state,
+        analyzer_ready=analyzer_ready,
+    )
 
     brand_mismatch = bool(analyzer_brand_issue)
-    has_volume_issue = bool(analyzer_volume_issue)
-    has_osd_issue = bool(analyzer_osd_issue)
 
     tv_brand_user = brand_row.details.get("tv_brand_user") if brand_row else None
     tv_brand_log = (
         brand_row.details.get("tv_brand_log") if brand_row else log_brand
     )
 
-    if final_stage and not log_evidence.autosync_started:
-        overall = StepStatus.FAIL
-        analysis_text = "TV auto-sync failed: auto-sync was not triggered in logs."
-    elif final_stage and log_evidence.autosync_started and not log_evidence.autosync_success:
-        overall = StepStatus.FAIL
-        analysis_text = "TV auto-sync failed: auto-sync did not complete successfully in logs."
-    elif not analyzer_ready:
+    if (
+        not log_evidence.autosync_started
+        and _has_autosync_signal(
+            tv_brand_log=tv_brand_log,
+            log_evidence=log_evidence,
+            volume_row=volume_row,
+            tv_control_evidence=tv_control_evidence,
+            raw_events=raw_events,
+            timeline_rows=timeline_rows,
+        )
+    ):
+        log_evidence.autosync_started = True
+
+    _apply_axis_timeline_status(
+        volume_row,
+        axis_label="TV volume",
+        tester_no=volume_no,
+        telemetry_state=telemetry_state,
+        analyzer_ready=analyzer_ready,
+        probe_confidence=probe_confidence,
+    )
+    _apply_axis_timeline_status(
+        osd_row,
+        axis_label="TV OSD",
+        tester_no=osd_no,
+        telemetry_state=telemetry_state,
+        analyzer_ready=analyzer_ready,
+        probe_confidence=probe_confidence,
+    )
+
+    tester_fail_volume = volume_no
+    tester_fail_osd = osd_no
+    tester_fail_pairing = pairing_no
+    functional_pass = volume_yes and osd_yes and pairing_yes
+    tester_fail = tester_fail_volume or tester_fail_osd or tester_fail_pairing
+    tester_verdict = "PASS" if functional_pass else ("FAIL" if tester_fail else "UNKNOWN")
+    autosync_never_started = final_stage and not log_evidence.autosync_started
+    autosync_failed = final_stage and log_evidence.autosync_started and not log_evidence.autosync_success
+    telemetry_confident_failure = telemetry_state == "STB_CONTROL_CONFIDENT"
+    telemetry_inconclusive = telemetry_state == "UNKNOWN"
+    pass_summary_prefix = (
+        "TV auto-sync functional criteria passed (tester confirmed volume, OSD, and pairing). "
+        if functional_pass
+        else "TV auto-sync functional checks did not report failures. "
+    )
+    if autosync_never_started:
+        log_verdict = "FAIL"
+        log_failure_reason = "Auto-sync was not triggered in logs."
+    elif autosync_failed:
+        log_verdict = "FAIL"
+        log_failure_reason = "Auto-sync did not complete successfully in logs."
+    elif telemetry_confident_failure:
+        log_verdict = "FAIL"
+        log_failure_reason = "Telemetry indicates STB is controlling volume/OSD despite tester confirmation."
+    elif telemetry_inconclusive:
+        log_verdict = "INCONCLUSIVE"
+        log_failure_reason = None
+    else:
+        log_verdict = "PASS"
+        log_failure_reason = None
+    conflict_tester_vs_logs = functional_pass and log_verdict == "FAIL"
+
+    if not analyzer_ready:
         overall = StepStatus.AWAITING_INPUT
         analysis_text = "TV auto-sync in progress – awaiting tester input."
-    elif brand_mismatch or has_volume_issue or has_osd_issue:
+    elif tester_fail:
         overall = StepStatus.FAIL
-        if brand_mismatch:
-            analysis_text = "TV auto-sync failed: TV brand seen by tester does not match logs."
-        elif missing_tv_responses:
+        if missing_tv_responses:
             analysis_text = "TV auto-sync failed: no TV responses observed (no volume change, no TV OSD)."
-        elif has_volume_issue and has_osd_issue:
-            analysis_text = "TV auto-sync failed: TV volume and OSD did not match expectations."
-        elif has_volume_issue:
-            analysis_text = "TV auto-sync failed: TV volume/behavior did not match expectations."
-        elif has_osd_issue:
-            analysis_text = "TV auto-sync failed: volume OSD did not match expectations."
+        elif tester_fail_volume and tester_fail_osd:
+            analysis_text = "TV auto-sync failed: tester did not observe TV volume change or OSD."
+        elif tester_fail_volume:
+            analysis_text = "TV auto-sync failed: tester did not observe TV volume change."
+        elif tester_fail_osd:
+            analysis_text = "TV auto-sync failed: tester did not observe TV OSD."
+        elif tester_fail_pairing:
+            analysis_text = "TV auto-sync failed: pairing screen was not seen."
         else:
-            analysis_text = "TV auto-sync failed: one or more checks did not pass."
+            analysis_text = "TV auto-sync failed: one or more tester checks did not pass."
+    elif brand_mismatch:
+        overall = StepStatus.FAIL
+        analysis_text = "TV auto-sync failed: TV brand seen by tester does not match logs."
+    elif log_verdict == "FAIL":
+        overall = StepStatus.FAIL
+        analysis_text = log_failure_reason or "TV auto-sync failed due to log evidence."
     else:
         overall = StepStatus.PASS
-        analysis_text = "TV auto-sync completed successfully with no detected issues."
+        if log_verdict == "INCONCLUSIVE":
+            analysis_text = pass_summary_prefix + "Telemetry probe was inconclusive – no TV responses observed."
+        else:
+            analysis_text = "TV auto-sync completed successfully with no detected issues."
+
+    failed_steps = [
+        row.name
+        for row in timeline_rows
+        if row.name in CRITICAL_STEPS and row.status == StepStatus.FAIL
+    ]
+
+    if summary_row:
+        summary_row.details["tester_verdict"] = tester_verdict
+        summary_row.details["log_verdict"] = log_verdict
+        summary_row.details["telemetry_state"] = telemetry_state
+        summary_row.details["conflict_tester_vs_logs"] = conflict_tester_vs_logs
+        if log_failure_reason:
+            summary_row.details["log_failure_reason"] = log_failure_reason
 
     positive_volume_signal = volume_yes and not has_volume_issue
     positive_osd_signal = osd_yes and not has_osd_issue
@@ -1459,6 +1756,10 @@ def _build_session_summary(
         has_volume_issue=has_volume_issue,
         has_osd_issue=has_osd_issue,
         final_autosync_success=final_autosync_success,
+        telemetry_state=telemetry_state,
+        brand_mismatch=brand_mismatch,
+        autosync_never_started=autosync_never_started,
+        autosync_failed=autosync_failed,
     )
 
     has_failure = overall == StepStatus.FAIL

@@ -11,7 +11,7 @@ interface Props {
 }
 
 type TimelineStatus = AnalyzerStepStatus | MetricTriState;
-type TimelineRow = TvAutoSyncTimelineEvent & { statusDisplay?: TimelineStatus };
+type TimelineRow = TvAutoSyncTimelineEvent;
 
 const warningPillStyle: React.CSSProperties = {
   background: 'rgba(251, 191, 36, 0.18)',
@@ -59,6 +59,26 @@ const buildInfo = (row: TimelineRow): string => {
     if (typeof summaryAnalysis === 'string' && summaryAnalysis.trim()) {
       parts.push(summaryAnalysis.trim());
     }
+    const testerVerdict = details.tester_verdict;
+    const logVerdict = details.log_verdict;
+    const telemetryState = details.telemetry_state;
+    if (testerVerdict) {
+      parts.push(`Tester verdict: ${testerVerdict}`);
+    }
+    if (logVerdict) {
+      parts.push(`Log verdict: ${logVerdict}`);
+    }
+    if (telemetryState) {
+      parts.push(`Telemetry state: ${telemetryState}`);
+    }
+    const conflict = details.conflict_tester_vs_logs;
+    if (typeof conflict === 'boolean') {
+      parts.push(`Conflict (tester vs logs): ${conflict ? 'YES' : 'NO'}`);
+    }
+    const failureReason = details.log_failure_reason;
+    if (typeof failureReason === 'string' && failureReason.trim()) {
+      parts.push(`Log finding: ${failureReason.trim()}`);
+    }
     const failedSteps = details.failed_steps as string[] | undefined;
     const awaitingSteps = details.awaiting_steps as string[] | undefined;
     if (row.status === 'FAIL' && Array.isArray(failedSteps) && failedSteps.length) {
@@ -67,19 +87,33 @@ const buildInfo = (row: TimelineRow): string => {
     if (row.status === 'FAIL' && Array.isArray(awaitingSteps) && awaitingSteps.length) {
       parts.push(`Awaiting: ${awaitingSteps.join(', ')}`);
     }
-  } else if (row.status === 'FAIL') {
-    ['mismatch_reason', 'analysis', 'note'].forEach((key) => {
+  } else {
+    ['mismatch_reason', 'analysis', 'note', 'probe_mismatch_reason'].forEach((key) => {
       const value = details[key];
       if (typeof value === 'string' && value.trim()) {
         parts.push(value.trim());
       }
     });
+    if (details.issue_confirmed_by_probe) {
+      parts.push('Probe confirmed this issue.');
+    }
+    const detectionState = details.volume_probe_detection_state;
+    if (typeof detectionState === 'string' && detectionState.trim()) {
+      parts.push(`Probe detection state: ${detectionState}`);
+    }
+    const probeState = details.volume_probe_state;
+    const probeConfidence = details.volume_probe_confidence;
+    if (typeof probeState === 'string') {
+      const confidenceText =
+        typeof probeConfidence === 'number' ? ` (confidence ${probeConfidence})` : '';
+      parts.push(`Probe source: ${probeState}${confidenceText}`);
+    }
   }
 
   return parts.length ? parts.join('\n') : '—';
 };
 
-const StepsTimeline: React.FC<Props> = ({ sessionId, rows, isLoading, error }) => {
+export const StepsTimeline: React.FC<Props> = ({ sessionId, rows, isLoading, error }) => {
   const timelineRows = rows ?? [];
 
   if (!sessionId) {
@@ -105,39 +139,41 @@ const StepsTimeline: React.FC<Props> = ({ sessionId, rows, isLoading, error }) =
   return (
     <div className="steps-timeline-container">
       <div className="space-y-3 text-sm">
-        <div className={`qa-grid-4cols qa-grid-4cols-header px-6`}>
-          <div className="text-left">Step</div>
+        <div className="qa-grid-4cols qa-grid-4cols-header px-6">
+          <div>Step</div>
           <div className="text-center">Status</div>
-          <div className="text-right">Timestamp</div>
-          <div className="text-left">Info</div>
+          <div>Timestamp</div>
+          <div>Info</div>
         </div>
 
         <div className="mt-3 space-y-1">
           {timelineRows.map((row, index) => {
             const key = `${row.name}-${row.timestamp ?? index}`;
-            const label = row.label || row.name;
-            const timestampText = row.timestamp ? new Date(row.timestamp).toLocaleString() : '—';
-            const infoText = buildInfo(row);
-
-            const displayStatus = (row.statusDisplay ?? row.status) as TimelineStatus;
-            const pillLabel = formatStatusText(displayStatus);
-            const pillStyle = displayStatus === 'INCOMPATIBILITY' ? warningPillStyle : undefined;
+            const status = row.status as TimelineStatus;
+            const pillLabel = formatStatusText(status);
+            const pillStyle = status === 'INCOMPATIBILITY' ? warningPillStyle : undefined;
+            const stepLabel =
+              row.label ??
+              ((row as { step_label?: string }).step_label ?? row.name);
+            const timestampValue = row.timestamp ? new Date(row.timestamp).toLocaleString() : '—';
+            const infoField = (row as { info?: string }).info;
+            const infoValue = infoField ?? buildInfo(row);
 
             return (
               <div
                 key={key}
-                className={`qa-grid-4cols qa-grid-4cols-row px-6`}
+                className="qa-grid-4cols qa-grid-4cols-row qa-step-row px-6"
               >
-                <div className="qa-col-text">{label}</div>
+                <div className="qa-col-text">{stepLabel}</div>
                 <div className="flex justify-center">
                   <span className="qa-col-pill">
-                    <span className={statusClass(displayStatus)} style={pillStyle}>
+                    <span className={statusClass(status)} style={pillStyle}>
                       {pillLabel}
                     </span>
                   </span>
                 </div>
-                <div className="qa-col-timestamp">{timestampText}</div>
-                <div className="qa-col-text-sm">{infoText}</div>
+                <div className="qa-col-timestamp">{timestampValue}</div>
+                <div className="qa-col-text-sm qa-step-info">{infoValue}</div>
               </div>
             );
           })}
