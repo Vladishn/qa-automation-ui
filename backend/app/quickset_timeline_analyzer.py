@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 from .analyzers.base import AnalyzerResult, FailureInsight
+from .quickset_log_signals import QuickSetLogSignals, extract_quickset_log_signals
 
 
 class StepStatus(str, Enum):
@@ -20,9 +21,7 @@ class StepStatus(str, Enum):
 
 
 MetricStatus = Literal["OK", "FAIL", "INCOMPATIBILITY", "NOT_EVALUATED"]
-TelemetryState = Literal["TV_CONTROL", "STB_CONTROL_CONFIDENT", "UNKNOWN"]
-PROBE_CONFIDENCE_CONFIDENT = 0.7
-
+TelemetryState = Literal["TV_CONTROL_CONFIDENT", "STB_CONTROL_CONFIDENT", "UNKNOWN"]
 
 WHITELISTED_STEPS = {
     "question_manual_trigger",
@@ -161,6 +160,16 @@ ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "evidence_keys": [],
     },
+    "tv_config_cleared_during_run": {
+        "category": "integration",
+        "severity": "medium",
+        "title": "QuickSet removed TV configuration",
+        "default_description": "QuickSet removed TV configuration during the run, so control reverted to STB.",
+        "recommendations": [
+            "Re-run TV auto-sync and verify TV configuration persists.",
+        ],
+        "evidence_keys": ["tv_config_events", "volume_source_history"],
+    },
 }
 
 TV_AUTO_SYNC_MARKERS = {
@@ -211,8 +220,6 @@ VOLUME_SIGNAL_KEYS = (
     "osd_stb",
     "osd_source",
 )
-
-VOLUME_PROBE_ISSUE_STATES = {"UNKNOWN", "NONE", "NO_TV_CONTROL", "STB"}
 
 
 @dataclass
@@ -274,14 +281,23 @@ class SessionSummary:
 class LogEvidence:
     autosync_started: bool = False
     autosync_success: bool = False
+    autosync_errors: List[str] = field(default_factory=list)
     osd_tv: bool = False
     osd_stb: bool = False
+    tv_volume_events: bool = False
+    tv_osd_events: bool = False
     volume_source: Optional[str] = None
     log_brand: Optional[str] = None
     log_text: str = ""
     ir_commands_sent: bool = False
     cec_events_detected: bool = False
     cec_inactive: bool = False
+    quickset_seen: bool = False
+    volume_source_history: List[str] = field(default_factory=list)
+    tv_config_seen: bool = False
+    tv_config_cleared_during_run: bool = False
+    tv_config_events: List[str] = field(default_factory=list)
+    stb_volume_events: bool = False
 
 
 def load_logcat_text(session_id: str) -> str:
@@ -380,6 +396,58 @@ def analyze_log_evidence(
     return evidence
 
 
+def _merge_quickset_signals(log_evidence: LogEvidence, signals: QuickSetLogSignals) -> None:
+    if not signals:
+        return
+    if signals.quickset_seen:
+        log_evidence.quickset_seen = True
+    if signals.tv_brand_detected:
+        log_evidence.log_brand = log_evidence.log_brand or signals.tv_brand_detected
+        log_evidence.autosync_started = True
+    if signals.autosync_started:
+        log_evidence.autosync_started = True
+    if signals.autosync_completed:
+        log_evidence.autosync_started = True
+    if signals.autosync_completed and not signals.autosync_errors:
+        log_evidence.autosync_success = True
+    if signals.autosync_errors:
+        log_evidence.autosync_started = True
+        for err in signals.autosync_errors:
+            cleaned = err.strip()
+            if cleaned and cleaned not in log_evidence.autosync_errors:
+                log_evidence.autosync_errors.append(cleaned)
+        if len(log_evidence.autosync_errors) > 12:
+            del log_evidence.autosync_errors[12:]
+    log_evidence.tv_volume_events = log_evidence.tv_volume_events or signals.tv_volume_events
+    log_evidence.tv_osd_events = log_evidence.tv_osd_events or signals.tv_osd_events
+    if signals.tv_osd_events:
+        log_evidence.osd_tv = True
+    log_evidence.ir_commands_sent = log_evidence.ir_commands_sent or signals.ir_commands_sent
+    log_evidence.cec_events_detected = log_evidence.cec_events_detected or signals.cec_events_detected
+    if signals.volume_source_events:
+        log_evidence.volume_source_history.extend(signals.volume_source_events)
+        if len(log_evidence.volume_source_history) > 60:
+            log_evidence.volume_source_history = log_evidence.volume_source_history[-60:]
+        last_source = next(
+            (src for src in reversed(log_evidence.volume_source_history) if src in {"TV", "STB"}),
+            None,
+        )
+        if last_source:
+            log_evidence.volume_source = last_source
+    if signals.stb_volume_events:
+        log_evidence.stb_volume_events = True
+    if signals.tv_config_events:
+        for entry in signals.tv_config_events:
+            if entry not in log_evidence.tv_config_events:
+                log_evidence.tv_config_events.append(entry)
+        if len(log_evidence.tv_config_events) > 12:
+            log_evidence.tv_config_events = log_evidence.tv_config_events[-12:]
+    log_evidence.tv_config_seen = log_evidence.tv_config_seen or signals.tv_config_seen
+    log_evidence.tv_config_cleared_during_run = (
+        log_evidence.tv_config_cleared_during_run or signals.tv_config_cleared_during_run
+    )
+
+
 def detect_autosync_from_events(events: List[Dict[str, Any]]) -> tuple[bool, bool]:
     started = False
     success = False
@@ -445,7 +513,10 @@ def build_timeline_and_summary(
     log_brand = _derive_log_brand(before_snap, after_snap, raw_events)
     event_autosync_started, event_autosync_success = detect_autosync_from_events(raw_events)
     log_text = load_logcat_text(session_id)
+    log_lines = log_text.splitlines()
     log_evidence = analyze_log_evidence(log_text, log_brand)
+    log_signals = extract_quickset_log_signals(log_lines)
+    _merge_quickset_signals(log_evidence, log_signals)
     log_evidence.autosync_started = event_autosync_started or log_evidence.autosync_started
     log_evidence.autosync_success = event_autosync_success or log_evidence.autosync_success
 
@@ -1087,31 +1158,9 @@ def _has_tv_control_evidence(
         return True
     if log_evidence.osd_tv:
         return True
+    if log_evidence.tv_volume_events or log_evidence.tv_osd_events:
+        return True
     return False
-
-
-def _derive_telemetry_state(
-    *,
-    tv_control_evidence: bool,
-    log_evidence: LogEvidence,
-    normalized_probe_state: str,
-    probe_confidence: float,
-) -> TelemetryState:
-    if (
-        tv_control_evidence
-        or normalized_probe_state == "TV"
-        or log_evidence.osd_tv
-        or log_evidence.cec_events_detected
-        or (log_evidence.volume_source or "").strip().upper() == "TV"
-    ):
-        return "TV_CONTROL"
-    strong_probe_negative = (
-        normalized_probe_state in {"STB", "NO_TV_CONTROL"}
-        and probe_confidence >= PROBE_CONFIDENCE_CONFIDENT
-    ) or (log_evidence.osd_stb and probe_confidence >= PROBE_CONFIDENCE_CONFIDENT)
-    if strong_probe_negative:
-        return "STB_CONTROL_CONFIDENT"
-    return "UNKNOWN"
 
 
 def _resolve_metric_status_from_tester(
@@ -1120,20 +1169,29 @@ def _resolve_metric_status_from_tester(
     tester_no: bool,
     telemetry_state: TelemetryState,
     analyzer_ready: bool,
+    telemetry_metric_status: Optional[MetricStatus] = None,
 ) -> tuple[MetricStatus, bool]:
     if not analyzer_ready:
         return "NOT_EVALUATED", False
     if tester_no:
         return "FAIL", True
-    if telemetry_state == "STB_CONTROL_CONFIDENT":
-        return "INCOMPATIBILITY", True
+    telemetry_issue = telemetry_state == "STB_CONTROL_CONFIDENT"
+    base_status: MetricStatus
+    if telemetry_metric_status:
+        base_status = telemetry_metric_status
+    elif telemetry_state == "TV_CONTROL_CONFIDENT":
+        base_status = "OK"
+    elif telemetry_state == "STB_CONTROL_CONFIDENT":
+        base_status = "INCOMPATIBILITY"
+    else:
+        base_status = "UNKNOWN"
+
     if tester_yes:
-        if telemetry_state == "UNKNOWN":
-            return "INCOMPATIBILITY", False
-        return "OK", False
-    if telemetry_state == "UNKNOWN":
-        return "INCOMPATIBILITY", False
-    return "OK", False
+        return base_status, telemetry_issue and base_status == "INCOMPATIBILITY"
+
+    if telemetry_state == "UNKNOWN" and not telemetry_metric_status:
+        return "UNKNOWN", False
+    return base_status, telemetry_issue and base_status == "INCOMPATIBILITY"
 
 
 def _flag_probe_issue(
@@ -1298,40 +1356,6 @@ def _compute_overall_status(rows: List[StepRow]) -> StepStatus:
     return StepStatus.PASS
 
 
-def _collect_probe_state(volume_row: Optional[StepRow], log_evidence: LogEvidence) -> tuple[str, float]:
-    if volume_row:
-        detection_state_raw = str(volume_row.details.get("volume_probe_detection_state") or "").strip().upper()
-        source_raw = str(volume_row.details.get("volume_probe_source") or "").strip().upper()
-        confidence_raw = _safe_float(volume_row.details.get("volume_probe_confidence"))
-    else:
-        detection_state_raw = ""
-        source_raw = ""
-        confidence_raw = None
-
-    detection_state = detection_state_raw
-    if detection_state == "TV_CONTROL":
-        detection_state = "TV"
-    elif detection_state == "STB_CONTROL":
-        detection_state = "STB"
-    elif detection_state == "NO_TV_CONTROL":
-        detection_state = "NO_TV_CONTROL"
-    elif detection_state in {"UNKNOWN", "NONE"}:
-        detection_state = "UNKNOWN"
-
-    if source_raw in {"TV", "STB", "UNKNOWN"}:
-        source = source_raw
-    else:
-        source = ""
-
-    fallback = str(log_evidence.volume_source or "").strip().upper()
-    if fallback and fallback not in {"TV", "STB"}:
-        fallback = ""
-
-    state = detection_state or source or fallback or "UNKNOWN"
-    confidence = confidence_raw if confidence_raw is not None else 0.0
-    return state, confidence
-
-
 def _volume_probe_metadata_present(row: Optional[StepRow]) -> bool:
     if not row:
         return False
@@ -1381,6 +1405,74 @@ def _has_autosync_signal(
     if _timeline_has_probe_event(raw_events, timeline_rows):
         return True
     return False
+
+
+def _normalize_volume_source(value: Optional[str]) -> str:
+    if value is None:
+        return "UNKNOWN"
+    upper = value.strip().upper()
+    if upper in {"TV", "STB"}:
+        return upper
+    if upper in {"1", "TELEVISION"}:
+        return "TV"
+    if upper in {"0", "SETTOP", "SET_TOP_BOX", "BOX"}:
+        return "STB"
+    return "UNKNOWN"
+
+
+def classify_volume_telemetry(
+    volume_source: Optional[str],
+    tv_volume_events: Optional[bool],
+    tv_osd_events: Optional[bool],
+    volume_probe_confidence: Optional[float] = None,
+    volume_source_history: Optional[List[str]] = None,
+    tv_config_seen: Optional[bool] = None,
+    tv_config_cleared: Optional[bool] = None,
+    stb_volume_events: Optional[bool] = None,
+) -> Tuple[TelemetryState, str, MetricStatus, Optional[Dict[str, Any]]]:
+    normalized_source = _normalize_volume_source(volume_source) if volume_source else None
+    tv_events = bool(tv_volume_events or tv_osd_events)
+    confidence = float(volume_probe_confidence or 0.0)
+    history = [src for src in (volume_source_history or []) if src in {"TV", "STB"}]
+    recent = history[-6:]
+    tv_count = recent.count("TV")
+    stb_count = recent.count("STB")
+    tv_config_active = bool(tv_config_seen and not tv_config_cleared)
+    last_state = next((src for src in reversed(recent) if src in {"TV", "STB"}), normalized_source)
+
+    tv_history_confident = tv_count >= max(2, stb_count + 1)
+    if tv_events or tv_history_confident or (tv_config_active and (tv_count >= max(1, stb_count) or last_state == "TV")):
+        return "TV_CONTROL_CONFIDENT", "TV", "OK", None
+
+    stb_history_confident = stb_count >= max(2, tv_count + 1)
+    stb_signals = bool(stb_volume_events) or normalized_source == "STB" or stb_history_confident
+    config_forces_stb = bool(tv_config_cleared and not tv_events)
+
+    if (stb_signals and not tv_events and not tv_config_active) or config_forces_stb:
+        severity = "high" if confidence >= 0.5 else "medium"
+        insight = {
+            "code": "probe_detected_stb_control",
+            "category": "functional",
+            "severity": severity,
+            "title": "Probe detected STB control",
+            "description": (
+                "Volume probe and logs indicate STB is controlling volume/OSD instead of the TV."
+            ),
+            "evidence_keys": ["volume_probe_state", "volume_probe_confidence"],
+        }
+        return "STB_CONTROL_CONFIDENT", "STB", "INCOMPATIBILITY", insight
+
+    insight = {
+        "code": "volume_probe_inconclusive",
+        "category": "tooling",
+        "severity": "low",
+        "title": "Volume probe inconclusive",
+        "description": (
+            "Volume probe and logs did not provide enough evidence of TV control."
+        ),
+        "evidence_keys": ["volume_probe_state", "tv_volume_events", "tv_osd_events"],
+    }
+    return "UNKNOWN", "UNKNOWN", "UNKNOWN", insight
 
 
 def _add_root_cause(
@@ -1437,24 +1529,16 @@ def _build_analysis_details(
     brand_mismatch: bool,
     autosync_never_started: bool,
     autosync_failed: bool,
+    probe_state: str,
+    probe_confidence: float,
 ) -> Tuple[List[FailureInsight], Dict[str, Any], List[str], str]:
     root_causes: List[FailureInsight] = []
     recs: List[str] = []
-    probe_state, probe_confidence = _collect_probe_state(volume_row, log_evidence)
 
     if volume_no:
         _add_root_cause(root_causes, recs, "tester_saw_no_volume_change", "Tester did not observe TV volume change.")
     if osd_no:
         _add_root_cause(root_causes, recs, "tester_saw_no_osd", "Tester did not observe TV OSD.")
-
-    probe_inconclusive = (probe_state in {"UNKNOWN", "NONE"} or not probe_state) and not tv_control_evidence
-    if probe_inconclusive:
-        _add_root_cause(
-            root_causes,
-            recs,
-            "volume_probe_inconclusive",
-            "Volume probe returned UNKNOWN; no evidence of TV control.",
-        )
 
     if missing_tv_responses:
         _add_root_cause(
@@ -1501,16 +1585,6 @@ def _build_analysis_details(
             "autosync_not_completed",
             "QuickSet logs show TV auto-sync started but not completed successfully.",
         )
-    if telemetry_state == "STB_CONTROL_CONFIDENT":
-        reason = "Probe indicates STB controls volume/OSD despite tester confirmation."
-        if log_evidence.volume_source:
-            reason = f"Probe indicates {log_evidence.volume_source} controls volume/OSD despite tester confirmation."
-        _add_root_cause(
-            root_causes,
-            recs,
-            "probe_detected_stb_control",
-            reason,
-        )
     if brand_mismatch:
         _add_root_cause(
             root_causes,
@@ -1518,15 +1592,34 @@ def _build_analysis_details(
             "brand_mismatch_detected",
             "Tester brand does not match logs.",
         )
+    if log_evidence.tv_config_cleared_during_run:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "tv_config_cleared_during_run",
+            "QuickSet removed TV configuration during the auto-sync run.",
+        )
+
+    tv_brand_detected = log_evidence.log_brand or tv_brand_detected
+    ir_commands_sent = log_evidence.ir_commands_sent
+    cec_events_detected = log_evidence.cec_events_detected
+    tv_osd_events = log_evidence.tv_osd_events or log_evidence.osd_tv
+    tv_volume_events = log_evidence.tv_volume_events or tv_control_evidence
+    volume_probe_state_local = probe_state or "UNKNOWN"
+    volume_probe_confidence_local = probe_confidence
 
     evidence_block = {
         "tv_brand_detected": tv_brand_detected,
-        "ir_commands_sent": log_evidence.ir_commands_sent,
-        "cec_events_detected": log_evidence.cec_events_detected,
-        "tv_osd_events": log_evidence.osd_tv,
-        "tv_volume_events": tv_control_evidence,
-        "volume_probe_state": probe_state or "UNKNOWN",
-        "volume_probe_confidence": probe_confidence,
+        "ir_commands_sent": ir_commands_sent,
+        "cec_events_detected": cec_events_detected,
+        "tv_osd_events": tv_osd_events,
+        "tv_volume_events": tv_volume_events,
+        "volume_probe_state": volume_probe_state_local,
+        "volume_probe_confidence": volume_probe_confidence_local,
+        "autosync_errors": list(log_evidence.autosync_errors),
+        "tv_config_cleared_during_run": log_evidence.tv_config_cleared_during_run,
+        "tv_config_events": list(log_evidence.tv_config_events[-6:]),
+        "volume_source_history": list(log_evidence.volume_source_history[-6:]),
     }
 
     contradiction_detected = any(
@@ -1576,14 +1669,21 @@ def _build_session_summary(
     pairing_no = pairing_answer in NO_ANSWERS
     tv_control_evidence = _has_tv_control_evidence(volume_row, osd_row, log_evidence)
     missing_tv_responses = volume_no and osd_no and not tv_control_evidence
-    probe_state, probe_confidence = _collect_probe_state(volume_row, log_evidence)
-    normalized_probe_state = (probe_state or "").strip().upper() or "UNKNOWN"
-    telemetry_state = _derive_telemetry_state(
-        tv_control_evidence=tv_control_evidence,
-        log_evidence=log_evidence,
-        normalized_probe_state=normalized_probe_state,
-        probe_confidence=probe_confidence,
+    volume_probe_step = next((r for r in timeline_rows if r.name == "volume_probe_result"), None)
+    probe_details = volume_probe_step.details if volume_probe_step else {}
+    raw_volume_source = probe_details.get("volume_source") or log_evidence.volume_source
+    probe_confidence_value = _safe_float(probe_details.get("confidence"))
+    telemetry_state, volume_probe_state, telemetry_metric_status, probe_insight = classify_volume_telemetry(
+        volume_source=str(raw_volume_source) if raw_volume_source else None,
+        tv_volume_events=log_evidence.tv_volume_events,
+        tv_osd_events=log_evidence.tv_osd_events or log_evidence.osd_tv,
+        volume_probe_confidence=probe_confidence_value,
+        volume_source_history=log_evidence.volume_source_history,
+        tv_config_seen=log_evidence.tv_config_seen,
+        tv_config_cleared=log_evidence.tv_config_cleared_during_run,
+        stb_volume_events=log_evidence.stb_volume_events,
     )
+    probe_confidence = float(probe_confidence_value or 0.0)
 
     brand_mismatch_raw = bool(brand_row and brand_row.details.get("brand_mismatch"))
 
@@ -1611,6 +1711,7 @@ def _build_session_summary(
         tester_no=volume_no,
         telemetry_state=telemetry_state,
         analyzer_ready=analyzer_ready,
+        telemetry_metric_status=telemetry_metric_status,
     )
     osd_status, has_osd_issue = _resolve_metric_status_from_tester(
         tester_yes=osd_yes,
@@ -1674,12 +1775,12 @@ def _build_session_summary(
     if autosync_never_started:
         log_verdict = "FAIL"
         log_failure_reason = "Auto-sync was not triggered in logs."
-    elif autosync_failed:
-        log_verdict = "FAIL"
-        log_failure_reason = "Auto-sync did not complete successfully in logs."
     elif telemetry_confident_failure:
         log_verdict = "FAIL"
         log_failure_reason = "Telemetry indicates STB is controlling volume/OSD despite tester confirmation."
+    elif autosync_failed:
+        log_verdict = "FAIL"
+        log_failure_reason = "Auto-sync did not complete successfully in logs."
     elif telemetry_inconclusive:
         log_verdict = "INCONCLUSIVE"
         log_failure_reason = None
@@ -1760,7 +1861,14 @@ def _build_session_summary(
         brand_mismatch=brand_mismatch,
         autosync_never_started=autosync_never_started,
         autosync_failed=autosync_failed,
+        probe_state=volume_probe_state,
+        probe_confidence=probe_confidence,
     )
+
+    if probe_insight:
+        insight_obj = FailureInsight(**probe_insight)
+        if not any(existing.code == insight_obj.code for existing in failure_insights):
+            failure_insights.append(insight_obj)
 
     has_failure = overall == StepStatus.FAIL
 

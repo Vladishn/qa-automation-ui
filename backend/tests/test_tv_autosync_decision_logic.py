@@ -122,13 +122,23 @@ def test_tv_auto_sync_probe_unknown_but_tester_pass_is_pass() -> None:
                 "brand_mismatch": False,
             },
         ),
+        StepRow(
+            name="volume_probe_result",
+            label="Volume probe result",
+            status=StepStatus.INFO,
+            details={
+                "volume_source": "TV",
+                "confidence": 0.8,
+            },
+        ),
     ]
     log_evidence = LogEvidence(
         autosync_started=True,
         autosync_success=True,
         osd_tv=False,
         osd_stb=False,
-        volume_source=None,
+        volume_source_history=["TV", "TV"],
+        tv_config_seen=True,
     )
 
     summary, analyzer_result = _run_summary(rows, log_evidence, log_brand=None)
@@ -136,15 +146,77 @@ def test_tv_auto_sync_probe_unknown_but_tester_pass_is_pass() -> None:
     assert summary.overall_status == StepStatus.PASS
     assert summary.has_failure is False
     assert summary.brand_status == "OK"
-    assert summary.volume_status == "INCOMPATIBILITY"
-    assert summary.osd_status == "INCOMPATIBILITY"
+    assert summary.volume_status == "UNKNOWN"
+    assert summary.osd_status == "UNKNOWN"
     assert summary.has_volume_issue is False
     assert summary.has_osd_issue is False
     assert summary.analysis_text.startswith("TV auto-sync functional criteria passed")
 
-    probe_insights = [ins for ins in analyzer_result.failure_insights if ins.code == "volume_probe_inconclusive"]
-    assert probe_insights, "Expected a volume_probe_inconclusive insight for telemetry UNKNOWN"
-    assert all(ins.category != "functional" for ins in probe_insights)
+    insight_codes = {ins.code: ins for ins in analyzer_result.failure_insights}
+    assert "volume_probe_inconclusive" in insight_codes
+    assert insight_codes["volume_probe_inconclusive"].category == "tooling"
+    assert "probe_detected_stb_control" not in insight_codes
+
+
+def test_tv_auto_sync_autosync_failed_but_telemetry_unknown_is_tooling() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="LG",
+            details={"tv_brand_user": "LG", "tv_brand_log": "LG"},
+        ),
+        StepRow(
+            name="volume_probe_result",
+            label="Volume probe result",
+            status=StepStatus.INFO,
+            details={
+                "volume_source": "UNKNOWN",
+                "confidence": 0.0,
+            },
+        ),
+    ]
+    log_evidence = LogEvidence(
+        autosync_started=True,
+        autosync_success=False,
+        tv_volume_events=False,
+        tv_osd_events=False,
+        volume_source_history=["UNKNOWN"],
+        tv_config_seen=True,
+    )
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="LG")
+
+    assert summary.overall_status == StepStatus.FAIL
+    assert summary.analysis_text.startswith("Auto-sync did not complete successfully in logs.")
+    assert summary.volume_status == "UNKNOWN"
+    assert summary.osd_status == "UNKNOWN"
+    assert summary.has_volume_issue is False
+    assert summary.has_osd_issue is False
+    insight_codes = {ins.code: ins for ins in analyzer_result.failure_insights}
+    assert "autosync_not_completed" in insight_codes
+    assert insight_codes["autosync_not_completed"].category == "functional"
+    assert insight_codes.get("volume_probe_inconclusive") is not None
+    assert insight_codes["volume_probe_inconclusive"].category == "tooling"
 
 
 def test_tv_auto_sync_probe_stb_control_confident_is_fail() -> None:
@@ -178,6 +250,15 @@ def test_tv_auto_sync_probe_stb_control_confident_is_fail() -> None:
             user_answer="LG",
             details={"tv_brand_user": "LG", "tv_brand_log": "LG"},
         ),
+        StepRow(
+            name="volume_probe_result",
+            label="Volume probe result",
+            status=StepStatus.INFO,
+            details={
+                "volume_source": "STB",
+                "confidence": 0.9,
+            },
+        ),
     ]
     log_evidence = LogEvidence(
         autosync_started=True,
@@ -185,6 +266,9 @@ def test_tv_auto_sync_probe_stb_control_confident_is_fail() -> None:
         osd_tv=False,
         osd_stb=True,
         volume_source="STB",
+        volume_source_history=["STB", "STB", "STB"],
+        stb_volume_events=True,
+        tv_config_seen=False,
     )
 
     summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="LG")
@@ -196,7 +280,155 @@ def test_tv_auto_sync_probe_stb_control_confident_is_fail() -> None:
     assert summary.has_volume_issue is True
     assert summary.has_osd_issue is True
     assert "telemetry indicates STB" in summary.analysis_text
-    assert any(ins.code == "probe_detected_stb_control" for ins in analyzer_result.failure_insights)
+    stb_insight = next(ins for ins in analyzer_result.failure_insights if ins.code == "probe_detected_stb_control")
+    assert stb_insight.category == "functional"
+    assert all(ins.code != "volume_probe_inconclusive" for ins in analyzer_result.failure_insights)
+
+
+def test_tv_auto_sync_good_log_sets_ok_status() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="Samsung",
+            details={"tv_brand_user": "Samsung", "tv_brand_log": "Samsung"},
+        ),
+    ]
+    log_evidence = LogEvidence(
+        autosync_started=True,
+        autosync_success=True,
+        tv_volume_events=True,
+        tv_osd_events=True,
+        volume_source_history=["STB", "TV", "TV"],
+        tv_config_seen=True,
+    )
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="Samsung")
+
+    assert summary.overall_status == StepStatus.PASS
+    assert summary.volume_status == "OK"
+    assert summary.osd_status == "OK"
+    assert summary.has_volume_issue is False
+    assert summary.has_osd_issue is False
+    assert all(ins.code != "probe_detected_stb_control" for ins in analyzer_result.failure_insights)
+
+
+def test_tv_auto_sync_tv_config_cleared_sets_incompatibility_and_insight() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="Philips",
+            details={"tv_brand_user": "Philips", "tv_brand_log": "Philips"},
+        ),
+    ]
+    log_evidence = LogEvidence(
+        autosync_started=True,
+        autosync_success=False,
+        tv_volume_events=False,
+        tv_osd_events=False,
+        volume_source_history=["TV", "STB", "STB"],
+        tv_config_seen=True,
+        tv_config_cleared_during_run=True,
+        stb_volume_events=True,
+    )
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="Philips")
+
+    assert summary.overall_status == StepStatus.FAIL
+    assert summary.volume_status == "INCOMPATIBILITY"
+    assert summary.osd_status == "INCOMPATIBILITY"
+    assert summary.has_volume_issue is True
+    assert summary.has_osd_issue is True
+    insight_codes = {ins.code for ins in analyzer_result.failure_insights}
+    assert "tv_config_cleared_during_run" in insight_codes
+
+
+def test_tv_auto_sync_mixed_signals_result_in_unknown() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="LG",
+            details={"tv_brand_user": "LG", "tv_brand_log": "LG"},
+        ),
+    ]
+    log_evidence = LogEvidence(
+        autosync_started=True,
+        autosync_success=True,
+        tv_volume_events=False,
+        tv_osd_events=False,
+        volume_source_history=["STB", "TV", "STB", "TV"],
+        tv_config_seen=False,
+        stb_volume_events=True,
+    )
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="LG")
+
+    assert summary.overall_status == StepStatus.PASS
+    assert summary.volume_status == "UNKNOWN"
+    assert summary.osd_status == "UNKNOWN"
+    assert summary.has_volume_issue is False
+    assert summary.has_osd_issue is False
+    tool_insight = next(ins for ins in analyzer_result.failure_insights if ins.code == "volume_probe_inconclusive")
+    assert tool_insight.category == "tooling"
 
 
 def test_tv_auto_sync_autosync_started_inferred_from_probe_signals() -> None:
@@ -230,6 +462,15 @@ def test_tv_auto_sync_autosync_started_inferred_from_probe_signals() -> None:
             user_answer="Samsung",
             details={"tv_brand_user": "Samsung", "tv_brand_log": "Samsung"},
         ),
+        StepRow(
+            name="volume_probe_result",
+            label="Volume probe result",
+            status=StepStatus.INFO,
+            details={
+                "volume_source": "STB",
+                "confidence": 0.9,
+            },
+        ),
     ]
     log_evidence = LogEvidence(
         autosync_started=False,
@@ -244,6 +485,51 @@ def test_tv_auto_sync_autosync_started_inferred_from_probe_signals() -> None:
     assert summary.overall_status == StepStatus.FAIL
     assert "Auto-sync was not triggered" not in summary.analysis_text
     assert any(ins.code == "probe_detected_stb_control" for ins in analyzer_result.failure_insights)
+    assert all(ins.code != "autosync_not_started" for ins in analyzer_result.failure_insights)
+
+
+def test_tv_auto_sync_started_but_not_completed_emits_not_completed_insight() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+            details={"volume_probe_detection_state": "unknown"},
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="LG",
+            details={"tv_brand_user": "LG", "tv_brand_log": "LG"},
+        ),
+    ]
+    log_evidence = LogEvidence(
+        autosync_started=True,
+        autosync_success=False,
+        osd_tv=False,
+        osd_stb=False,
+        volume_source=None,
+    )
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="LG")
+
+    assert summary.overall_status == StepStatus.FAIL
+    assert "did not complete" in summary.analysis_text
+    assert any(ins.code == "autosync_not_completed" for ins in analyzer_result.failure_insights)
     assert all(ins.code != "autosync_not_started" for ins in analyzer_result.failure_insights)
 
 
