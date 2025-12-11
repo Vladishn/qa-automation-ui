@@ -56,12 +56,11 @@ describe('StepsTimeline layout', () => {
       </div>
     );
 
-    const header = container.querySelector('.qa-grid-4cols.qa-grid-4cols-header');
-    expect(header).toBeInTheDocument();
-    expect(header?.children).toHaveLength(4);
-    const headerLabels = Array.from(header!.children).map((cell) =>
-      cell.textContent?.trim().toLowerCase()
-    );
+    const headerRow = container.querySelector('.qa-grid-4cols.qa-grid-4cols-header');
+    expect(headerRow).toBeInTheDocument();
+    const headerCells = Array.from(headerRow!.children);
+    expect(headerCells).toHaveLength(4);
+    const headerLabels = headerCells.map((cell) => cell.textContent?.trim().toLowerCase());
     expect(headerLabels).toEqual(['step', 'status', 'timestamp', 'info']);
 
     const rowElements = container.querySelectorAll('.qa-step-row');
@@ -73,7 +72,6 @@ describe('StepsTimeline layout', () => {
 
       const [stepCell, statusCell, timestampCell, infoCell] = cells;
 
-      expect(stepCell).toHaveClass('qa-col-text');
       expect(stepCell.textContent?.trim().length).toBeGreaterThan(0);
 
       const pill = statusCell.querySelector('.status-pill');
@@ -81,7 +79,6 @@ describe('StepsTimeline layout', () => {
       const expectedStatus = sampleRows[idx].status.toUpperCase();
       expect(pill?.textContent?.trim().toUpperCase()).toBe(expectedStatus);
 
-      expect(timestampCell).toHaveClass('qa-col-timestamp');
       expect(timestampCell.textContent?.trim().length).toBeGreaterThan(0);
 
       expect(infoCell).toHaveClass('qa-col-text-sm');

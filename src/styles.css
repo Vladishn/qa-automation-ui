@@ -620,3 +620,10 @@ body {
 .sidebar-parent.active {
   border-radius: 999px;
 }
+
+/* === QuickSet Runner – unify card backgrounds === */
+.quickset-summary-card,
+.steps-timeline-container {
+  /* אותו רקע כמו .card */
+  background: rgba(255, 255, 255, 0.04) !important;
+}

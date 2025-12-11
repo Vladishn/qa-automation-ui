@@ -1,0 +1,1 @@
+++ we'll use apply_patch to add new content? easier to cat entire file from scratch? we removed content earlier? We changed entire file to empty? need to re-add new code using apply_patch update entire file. use cat? Maybe easiest to remove file and re-add? but apply_patch we already removed entire file? `apply_patch` replaced file with nothing? we need to check file. 

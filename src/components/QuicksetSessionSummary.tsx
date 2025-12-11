@@ -1,13 +1,11 @@
-import React from 'react';
-import { deriveUiStatusFromAnalyzer, deriveVolumeTileState, deriveOsdTileState } from '../logic/quicksetStatus';
-import { deriveMetricStatuses, formatTriStateLabel } from '../logic/quicksetMetrics';
+import React, { useState } from 'react';
+import { deriveUiStatusFromAnalyzer } from '../logic/quicksetStatus';
 import type { MetricStatusesResult } from '../logic/quicksetMetrics';
 import type {
   TvAutoSyncSession,
   TvAutoSyncTimelineEvent,
   QuicksetAnalysisDetails,
-  FailureInsight,
-  MetricTriState
+  FailureInsight
 } from '../types/quickset';
 import './QuicksetSessionSummary.css';
 
@@ -31,26 +29,6 @@ const statusClass = (status: StatusBadge): string => {
   }
 };
 
-type StatusVariant = 'success' | 'danger' | 'neutral' | 'warning';
-interface StatusDescriptor {
-  label: string;
-  variant: StatusVariant;
-  detail?: string;
-}
-
-const pillClassForVariant = (variant: StatusVariant): string => {
-  switch (variant) {
-    case 'success':
-      return 'status-pill status-pill--pass';
-    case 'danger':
-      return 'status-pill status-pill--fail';
-    case 'warning':
-      return 'status-pill status-pill--info';
-    default:
-      return 'status-pill status-pill--info';
-  }
-};
-
 const confidenceBadgeClass = (confidence: 'low' | 'medium' | 'high'): string => {
   if (confidence === 'high') {
     return 'status-pill status-pill--pass';
@@ -59,84 +37,6 @@ const confidenceBadgeClass = (confidence: 'low' | 'medium' | 'high'): string => 
     return 'status-pill status-pill--info';
   }
   return 'status-pill status-pill--fail';
-};
-
-const warningPillStyle: React.CSSProperties = {
-  background: 'rgba(251, 191, 36, 0.18)',
-  color: '#fbbf24'
-};
-
-const describeBinaryMetricStatus = (
-  status: MetricTriState,
-  metric: 'volume' | 'osd',
-  analyzerIssue: boolean,
-  testerAnswer: string | null | undefined
-): StatusDescriptor => {
-  const normalizedAnswer = testerAnswer ? testerAnswer.trim().toLowerCase() : null;
-  const testerSeesIssue = normalizedAnswer === 'no';
-  const testerSeesOk = normalizedAnswer === 'yes';
-  const pillLabel = formatTriStateLabel(status);
-  const descriptions =
-    metric === 'volume'
-      ? {
-          ok: 'Analyzer and tester agree TV volume control is OK.',
-          fail: 'Analyzer confirmed volume issue.',
-          incompatAnalyzerIssue: 'Tester reported control, but analyzer saw no TV volume events.',
-          incompatTesterIssue: 'Tester reported no control, but analyzer saw TV volume events.',
-          incompatGeneric: 'Analyzer and tester disagree on TV volume control.'
-        }
-      : {
-          ok: 'Analyzer and tester agree TV OSD is OK.',
-          fail: 'Analyzer confirmed OSD issue.',
-          incompatAnalyzerIssue: 'Tester reported seeing OSD, but analyzer saw no TV OSD events.',
-          incompatTesterIssue: 'Tester reported no OSD, but analyzer saw TV OSD events.',
-          incompatGeneric: 'Analyzer and tester disagree on TV OSD.'
-        };
-
-  if (status === 'FAIL') {
-    return { label: pillLabel, variant: 'danger', detail: descriptions.fail };
-  }
-  if (status === 'INCOMPATIBILITY') {
-    if (analyzerIssue) {
-      return {
-        label: pillLabel,
-        variant: 'warning',
-        detail: testerSeesOk ? descriptions.incompatAnalyzerIssue : descriptions.incompatGeneric
-      };
-    }
-    if (testerSeesIssue) {
-      return {
-        label: pillLabel,
-        variant: 'warning',
-        detail: descriptions.incompatTesterIssue
-      };
-    }
-    return {
-      label: pillLabel,
-      variant: 'warning',
-      detail: descriptions.incompatGeneric
-    };
-  }
-  if (status === 'OK') {
-    return { label: pillLabel, variant: 'success', detail: descriptions.ok };
-  }
-  return { label: pillLabel, variant: 'neutral', detail: 'Awaiting analyzer' };
-};
-
-const renderMetricPill = (descriptor: StatusDescriptor) => (
-  <span
-    className={pillClassForVariant(descriptor.variant)}
-    style={descriptor.variant === 'warning' ? warningPillStyle : undefined}
-  >
-    {descriptor.label}
-  </span>
-);
-
-const asTriState = (value: unknown): MetricTriState | undefined => {
-  if (value === 'OK' || value === 'FAIL' || value === 'INCOMPATIBILITY' || value === 'NOT_EVALUATED') {
-    return value;
-  }
-  return undefined;
 };
 
 const timelineStepByName = (timeline: TvAutoSyncTimelineEvent[], name: string) =>
@@ -162,7 +62,8 @@ const telemetryEvidenceKeys: string[] = [
   'issue_confirmed_by_probe'
 ];
 
-const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStatuses }) => {
+const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline }) => {
+  const [showRootCause, setShowRootCause] = useState(false);
   const scenarioTitle = session.scenario_name && session.scenario_name !== 'UNKNOWN'
     ? session.scenario_name
     : 'TV_AUTO_SYNC';
@@ -176,27 +77,10 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
   const analysisDetails: QuicksetAnalysisDetails | undefined = analysisSummaryRow
     ? (analysisSummaryRow.details as QuicksetAnalysisDetails)
     : undefined;
-  const derivedMetrics = deriveMetricStatuses(session, analysisDetails);
-  const metrics: MetricStatusesResult =
-    metricStatuses ??
-    {
-      ...derivedMetrics,
-      brandStatus: asTriState(session.brand_status) ?? derivedMetrics.brandStatus,
-      volumeStatus: asTriState(session.volume_status) ?? derivedMetrics.volumeStatus,
-      osdStatus: asTriState(session.osd_status) ?? derivedMetrics.osdStatus,
-      hasBrandMismatch:
-        typeof session.brand_mismatch === 'boolean' ? session.brand_mismatch : derivedMetrics.hasBrandMismatch
-    };
-  const analyzerReady = metrics.analyzerReady;
-  const { brandStatus: brandTriState, volumeStatus: volumeTriState, osdStatus: osdTriState } = metrics;
-
   const volumeStep = timelineStepByName(timeline, 'question_tv_volume_changed');
   const osdStep = timelineStepByName(timeline, 'question_tv_osd_seen');
   const pairingStep = timelineStepByName(timeline, 'question_pairing_screen_seen');
   const brandStep = timelineStepByName(timeline, 'question_tv_brand_ui');
-
-  const volumeTile = deriveVolumeTileState(session, timeline);
-  const osdTile = deriveOsdTileState(session, timeline);
 
   const failureInsights: FailureInsight[] = analysisDetails?.failure_insights ?? [];
   const analysisEvidence = analysisDetails?.evidence as Record<string, unknown> | undefined;
@@ -236,53 +120,8 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
     }))
     .filter((item) => item.value !== undefined);
 
-  const brandStatus: StatusDescriptor = (() => {
-    const brandLabel = formatTriStateLabel(brandTriState);
-    if (brandTriState === 'FAIL') {
-      // FAIL should not occur for brand, but fall back to mismatch copy.
-      const mismatchDetail =
-        session.tv_brand_user && session.tv_brand_log
-          ? `Tester saw ${session.tv_brand_user}, logs show ${session.tv_brand_log}.`
-          : 'Brand mismatch detected between UI and logs.';
-      return { label: brandLabel, variant: 'danger', detail: mismatchDetail };
-    }
-    if (brandTriState === 'INCOMPATIBILITY') {
-      return {
-        label: brandLabel,
-        variant: 'warning',
-        detail:
-          session.tv_brand_user && session.tv_brand_log
-            ? `Tester saw ${session.tv_brand_user}, logs show ${session.tv_brand_log}.`
-            : 'Analyzer and tester disagree on brand. Analyzer sees mismatch in logs.'
-      };
-    }
-    if (brandTriState === 'OK') {
-      return { label: brandLabel, variant: 'success', detail: 'Brand match between UI and logs.' };
-    }
-    return { label: brandLabel, variant: 'neutral', detail: 'Awaiting analyzer' };
-  })();
-
-  const volumeStatus = describeBinaryMetricStatus(
-    volumeTriState,
-    'volume',
-    Boolean(session.has_volume_issue),
-    volumeTile.answer
-  );
-  const osdStatus = describeBinaryMetricStatus(
-    osdTriState,
-    'osd',
-    Boolean(session.has_osd_issue),
-    osdTile.answer
-  );
-
-  const analysisNotes =
-    (session as { analysis_result?: { notes?: string | null } }).analysis_result?.notes ?? null;
-  const testerNotesRaw = session.notes ?? analysisNotes ?? null;
-  const hasTesterNotes = typeof testerNotesRaw === 'string' && testerNotesRaw.trim().length > 0;
-  const testerNotes = hasTesterNotes ? testerNotesRaw.trim() : null;
-
   return (
-    <div className="qs-summary">
+    <div className="qs-summary flex flex-col gap-4 text-sm text-slate-100">
       <div className="qs-summary-header">
         <div>
           <div className="qs-summary-title">{scenarioTitle}</div>
@@ -295,21 +134,6 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
         {analyzerUi.reasonLines.length
           ? analyzerUi.reasonLines.map((line, idx) => <div key={line + idx}>• {line}</div>)
           : 'Analyzer output not available yet.'}
-      </div>
-
-      <div className="qs-summary-grid">
-        <div>
-          <div className="metric-label">BRAND</div>
-          <div className="metric-pill">{renderMetricPill(brandStatus)}</div>
-        </div>
-        <div>
-          <div className="metric-label">VOLUME</div>
-          <div className="metric-pill">{renderMetricPill(volumeStatus)}</div>
-        </div>
-        <div>
-          <div className="metric-label">OSD</div>
-          <div className="metric-pill">{renderMetricPill(osdStatus)}</div>
-        </div>
       </div>
 
       <div className="qs-summary-sections">
@@ -387,26 +211,42 @@ const QuicksetSessionSummary: React.FC<Props> = ({ session, timeline, metricStat
         </section>
       </div>
 
-      {testerNotes && (
-        <div className="qs-summary-notes">
-          <h4 className="metric-label">NOTES</h4>
-          <p className="notes-text">{testerNotes}</p>
-        </div>
-      )}
-
       {shouldRenderDiagnostics && (
         <div className="qs-summary-diagnostics">
           {hasInsights && (
             <section className="qs-diagnostic-section">
-              <h4>Why did it fail?</h4>
-              <ul>
-                {failureInsights.map((insight) => (
-                  <li key={insight.code}>
-                    <strong>{insight.title}</strong>
-                    <div>{insight.description}</div>
-                  </li>
-                ))}
-              </ul>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between py-2 text-sm font-medium text-slate-200 hover:text-slate-100"
+                onClick={() => setShowRootCause((value) => !value)}
+              >
+                <span>Why did it fail?</span>
+                <svg
+                  className={`h-4 w-4 transition-transform ${showRootCause ? 'rotate-180' : ''}`}
+                  viewBox="0 0 20 20"
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M6 8l4 4 4-4"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              {showRootCause && (
+                <ul className="mt-1 space-y-2 text-xs text-slate-300">
+                  {failureInsights.map((insight) => (
+                    <li key={insight.code}>
+                      <strong>{insight.title}</strong>
+                      <div>{insight.description}</div>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </section>
           )}
 

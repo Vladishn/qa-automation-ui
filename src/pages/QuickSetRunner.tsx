@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import StepsTimeline from '../components/StepsTimeline';
 import QuicksetSessionSummary from '../components/QuicksetSessionSummary';
+import { DashboardCard } from '../components/layout/DashboardCard';
+import { StbIpField } from '../components/fields/StbIpField';
 import type { QuickSetQuestion } from '../types/domain';
 import type {
   MetricTriState,
@@ -12,6 +14,7 @@ import { deriveUiStatusFromAnalyzer } from '../logic/quicksetStatus';
 import { deriveMetricStatuses, type MetricStatusesResult } from '../logic/quicksetMetrics';
 import { runScenario, answerQuestion } from '../services/quicksetService';
 import { useSessionPolling } from '../hooks/useSessionPolling';
+
 
 const defaultForm = {
   testerId: '',
@@ -96,8 +99,7 @@ const QuickSetRunner: React.FC = () => {
       setForm((prev) => ({ ...prev, [field]: event.target.value }));
     };
 
-  const onSubmit = async (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleStartScenario = async () => {
     setSubmitError(null);
 
     if (!form.testerId || !form.stbIp || !form.apiKey) {
@@ -267,34 +269,37 @@ const QuickSetRunner: React.FC = () => {
   };
 
   return (
-    <div className="w-full max-w-[1800px] mx-auto px-6 py-10 lg:px-12 lg:py-12">
-      <h2 className="page-title">QuickSet Runner · TV_AUTO_SYNC</h2>
-      <p className="page-subtitle">
-        Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API
-        key to kick off the flow and monitor progress, steps, and logs in real time.
-      </p>
+    <div className="mx-auto w-full max-w-[1400px] space-y-6 px-4 py-10 sm:px-6 lg:px-8">
+      <div className="space-y-3">
+        <h2 className="page-title">QuickSet Runner · TV_AUTO_SYNC</h2>
+        <p className="page-subtitle">
+          Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API
+          key to kick off the flow and monitor progress, steps, and logs in real time.
+        </p>
+      </div>
 
-      {submitError && (
-        <p className="hint" style={{ color: '#e67e22' }}>
-          {submitError}
-        </p>
-      )}
-      {pollError && (
-        <p className="hint" style={{ color: '#e67e22' }}>
-          {pollError}
-        </p>
-      )}
-      {answerError && (
-        <p className="hint" style={{ color: '#e67e22' }}>
-          {answerError}
-        </p>
-      )}
+      <div className="space-y-2">
+        {submitError && (
+          <p className="hint" style={{ color: '#e67e22' }}>
+            {submitError}
+          </p>
+        )}
+        {pollError && (
+          <p className="hint" style={{ color: '#e67e22' }}>
+            {pollError}
+          </p>
+        )}
+        {answerError && (
+          <p className="hint" style={{ color: '#e67e22' }}>
+            {answerError}
+          </p>
+        )}
+      </div>
 
       {/* TOP ROW: Run form + Session status */}
-      <div className="mt-6 grid grid-cols-1 gap-12 lg:grid-cols-2">
-        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
-          <h3 className="text-lg font-semibold">Run QuickSet Scenario</h3>
-          <form onSubmit={onSubmit} className="flex flex-col space-y-4">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <DashboardCard title="Run QuickSet Scenario">
+          <div className="flex flex-col space-y-4">
             <label className="flex flex-col space-y-1 text-sm font-medium">
               <span>Scenario</span>
               <select
@@ -314,47 +319,56 @@ const QuickSetRunner: React.FC = () => {
               <span>Tester ID</span>
               <input
                 type="text"
+                name="testerId"
                 value={form.testerId}
                 onChange={handleChange('testerId')}
                 placeholder="tester-golan-001"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 style={inputStyle}
               />
             </label>
 
             <label className="flex flex-col space-y-1 text-sm font-medium">
               <span>STB IP</span>
-              <input
-                type="text"
+              <StbIpField
                 value={form.stbIp}
-                onChange={handleChange('stbIp')}
-                placeholder="192.168.1.200"
-                style={inputStyle}
+                onChange={(val) => setForm((prev) => ({ ...prev, stbIp: val }))}
+                disabled={isSubmitting || sessionActive}
               />
             </label>
 
             <label className="flex flex-col space-y-1 text-sm font-medium">
               <span>API Key</span>
               <input
-                type="password"
+                type="text"
+                name="quicksetApiKey"
+                className="[text-security:disc] [-webkit-text-security:disc]"
                 value={form.apiKey}
                 onChange={handleChange('apiKey')}
                 placeholder="X-QuickSet-Api-Key"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 style={inputStyle}
               />
             </label>
 
             <button
-              type="submit"
-              className="sidebar-item"
+              type="button"
+              onClick={handleStartScenario}
+              className="mt-4 inline-flex items-center justify-center rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
               disabled={isSubmitting || sessionActive}
             >
-              {isSubmitting ? 'Starting…' : sessionActive ? 'Scenario Active' : 'Start Test'}
+              {isSubmitting ? 'Starting…' : sessionActive ? 'Scenario Active' : 'Start test'}
             </button>
-          </form>
-        </div>
+          </div>
+        </DashboardCard>
 
-        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
-          <h3 className="text-lg font-semibold">Session Status</h3>
+        <DashboardCard title="Session Status">
           <dl className="grid grid-cols-1 gap-x-8 gap-y-2 text-sm sm:grid-cols-2">
             <div>
               <dt className="text-xs uppercase tracking-wide text-slate-400">Session ID</dt>
@@ -418,42 +432,42 @@ const QuickSetRunner: React.FC = () => {
               {renderQuestionControls(pendingQuestion)}
             </div>
           )}
-        </div>
+        </DashboardCard>
       </div>
 
       {/* SECOND ROW: Summary + Timeline */}
-      <div className="mt-10 grid grid-cols-1 gap-12 lg:grid-cols-2">
-        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
-          <h3 className="text-lg font-semibold">QuickSet Summary</h3>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2 items-stretch">
+        <DashboardCard title="QuickSet Summary" className="h-full flex flex-col" bodyClassName="flex-1 flex flex-col">
           {renderQuicksetSummary()}
-        </div>
+        </DashboardCard>
 
-        <div className="card qa-card w-full h-full space-y-4 px-10 py-8">
-          <h3 className="text-lg font-semibold">Steps Timeline</h3>
+        <DashboardCard
+          title="Steps Timeline"
+          className="h-full flex flex-col"
+          bodyClassName="px-0 pb-0 flex-1 flex flex-col"
+        >
           <StepsTimeline sessionId={sessionId} rows={timelineForDisplay} />
-        </div>
+        </DashboardCard>
       </div>
 
       {showLogs && (
-        <>
-          <div className="card w-full h-full px-10 py-8" style={{ marginBottom: 24 }}>
-            <h3>ADB Logs</h3>
+        <div className="space-y-6">
+          <DashboardCard title="ADB logs">
             <div className="adb-logs-container">
               <pre className="adb-logs-text">
                 {formatLogPreview(runtimeSession?.logs?.adb)}
               </pre>
             </div>
-          </div>
+          </DashboardCard>
 
-          <div className="card w-full h-full px-10 py-8">
-            <h3>Logcat Logs</h3>
+          <DashboardCard title="Logcat logs">
             <div className="adb-logs-container">
               <pre className="adb-logs-text">
                 {formatLogPreview(runtimeSession?.logs?.logcat)}
               </pre>
             </div>
-          </div>
-        </>
+          </DashboardCard>
+        </div>
       )}
     </div>
   );
