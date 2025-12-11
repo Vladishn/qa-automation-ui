@@ -1,4 +1,4 @@
-from backend.app.quickset_log_signals import extract_quickset_log_signals
+from backend.app.quickset_log_parser import parse_quickset_logs
 
 GOOD_QUICKSET_LOG = """
 12-08 10:02:43.628 D/QSDPRINT(13313): Entry QSP_get_device_brand, device ID: 0
@@ -35,43 +35,41 @@ BAD_QUICKSET_LOG = """
 """
 
 
-def _lines(text: str) -> list[str]:
-    return [line for line in text.strip().splitlines() if line.strip()]
-
-
-def test_extract_quickset_log_signals_detects_successful_flow_and_history() -> None:
-    signals = extract_quickset_log_signals(_lines(GOOD_QUICKSET_LOG))
+def test_parse_quickset_logs_detects_successful_flow_and_history() -> None:
+    signals = parse_quickset_logs(GOOD_QUICKSET_LOG)
 
     assert signals.quickset_seen is True
     assert signals.autosync_started is True
-    assert signals.autosync_completed is True
-    assert signals.autosync_errors == []
-    assert signals.tv_brand_detected == "Samsung"
-    assert signals.tv_volume_events is True
-    assert signals.tv_osd_events is True
-    assert signals.volume_source_events[-1] == "TV"
+    assert signals.autosync_completed_successfully is True
+    assert signals.autosync_error_codes == []
+    assert signals.tv_brand_inferred == "Samsung"
+    assert signals.tv_volume_events >= 1
+    assert signals.tv_osd_events >= 1
+    assert signals.volume_source_history[-1] == "TV"
     assert signals.tv_config_seen is True
     assert signals.tv_config_cleared_during_run is False
 
 
-def test_extract_quickset_log_signals_tracks_transitions() -> None:
-    signals = extract_quickset_log_signals(_lines(VOLUME_STB_TV_LOG))
+def test_parse_quickset_logs_tracks_transitions() -> None:
+    signals = parse_quickset_logs(VOLUME_STB_TV_LOG)
 
     assert signals.autosync_started is True
-    assert signals.autosync_completed is True
-    assert signals.volume_source_events.count("STB") >= 1
-    assert signals.volume_source_events[-1] == "TV"
-    assert signals.stb_volume_events is True
+    assert signals.autosync_completed_successfully is True
+    assert signals.volume_source_history.count("STB") >= 1
+    assert signals.volume_source_final == "TV"
+    assert signals.stb_volume_events >= 1
+    assert signals.volume_switch_events >= 1
     assert signals.tv_config_seen is True
 
 
-def test_extract_quickset_log_signals_detects_config_clear() -> None:
-    signals = extract_quickset_log_signals(_lines(BAD_QUICKSET_LOG))
+def test_parse_quickset_logs_detects_config_clear_and_failures() -> None:
+    signals = parse_quickset_logs(BAD_QUICKSET_LOG)
 
     assert signals.autosync_started is True
-    assert signals.autosync_completed is False
+    assert signals.autosync_completed_successfully is False
+    assert signals.autosync_failed is True
     assert signals.tv_config_seen is True
     assert signals.tv_config_cleared_during_run is True
-    assert signals.stb_volume_events is True
-    assert signals.volume_source_events[-1] == "STB"
-    assert signals.autosync_errors
+    assert signals.stb_volume_events >= 1
+    assert signals.volume_source_final == "STB"
+    assert signals.autosync_error_codes

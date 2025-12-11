@@ -10,7 +10,10 @@ import re
 from pathlib import Path
 
 from .analyzers.base import AnalyzerResult, FailureInsight
-from .quickset_log_signals import QuickSetLogSignals, extract_quickset_log_signals
+from .quickset_log_parser import QuicksetLogSignals, parse_quickset_logs
+
+# QuickSet log parsing relies on QuicksetLogSignals/parse_quickset_logs as the
+# single source of truth for TV_AUTO_SYNC log evidence.
 
 
 class StepStatus(str, Enum):
@@ -160,6 +163,16 @@ ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "evidence_keys": [],
     },
+    "autosync_logs_inconclusive": {
+        "category": "tooling",
+        "severity": "low",
+        "title": "Logs inconclusive for auto-sync",
+        "default_description": "Logs did not contain QuickSet or volume/OSD signals; relying on tester verdict.",
+        "recommendations": [
+            "Retry TV auto-sync and ensure device logs include QuickSet output.",
+        ],
+        "evidence_keys": [],
+    },
     "tv_config_cleared_during_run": {
         "category": "integration",
         "severity": "medium",
@@ -298,6 +311,15 @@ class LogEvidence:
     tv_config_cleared_during_run: bool = False
     tv_config_events: List[str] = field(default_factory=list)
     stb_volume_events: bool = False
+    log_signals: Optional[QuicksetLogSignals] = None
+
+
+@dataclass
+class AutosyncLogVerdictInfo:
+    autosync_started: bool
+    autosync_success: bool
+    autosync_failed: bool
+    logs_inconclusive: bool
 
 
 def load_logcat_text(session_id: str) -> str:
@@ -396,105 +418,89 @@ def analyze_log_evidence(
     return evidence
 
 
+def _evaluate_autosync_from_logs(log_signals: Optional[QuicksetLogSignals]) -> AutosyncLogVerdictInfo:
+    if not log_signals:
+        return AutosyncLogVerdictInfo(
+            autosync_started=False,
+            autosync_success=False,
+            autosync_failed=False,
+            logs_inconclusive=True,
+        )
+    started = bool(log_signals.autosync_started)
+    success = bool(log_signals.autosync_completed_successfully)
+    failed = bool(log_signals.autosync_failed or log_signals.autosync_error_codes)
+    logs_inconclusive = (
+        not log_signals.quickset_seen
+        and not started
+        and not success
+        and not log_signals.autosync_failed
+        and not log_signals.autosync_error_codes
+        and log_signals.tv_volume_events == 0
+        and log_signals.tv_osd_events == 0
+        and log_signals.stb_volume_events == 0
+        and log_signals.stb_osd_events == 0
+    )
+    return AutosyncLogVerdictInfo(
+        autosync_started=started,
+        autosync_success=success,
+        autosync_failed=failed,
+        logs_inconclusive=logs_inconclusive,
+    )
+
+
 def _merge_quickset_signals(log_evidence: LogEvidence, signals: QuickSetLogSignals) -> None:
     if not signals:
         return
+    log_evidence.log_signals = signals
     if signals.quickset_seen:
         log_evidence.quickset_seen = True
-    if signals.tv_brand_detected:
-        log_evidence.log_brand = log_evidence.log_brand or signals.tv_brand_detected
+    if signals.tv_brand_inferred:
+        log_evidence.log_brand = log_evidence.log_brand or signals.tv_brand_inferred
+    if signals.autosync_started or signals.autosync_completed_successfully or signals.autosync_failed:
         log_evidence.autosync_started = True
-    if signals.autosync_started:
-        log_evidence.autosync_started = True
-    if signals.autosync_completed:
-        log_evidence.autosync_started = True
-    if signals.autosync_completed and not signals.autosync_errors:
+    if signals.autosync_completed_successfully:
         log_evidence.autosync_success = True
-    if signals.autosync_errors:
-        log_evidence.autosync_started = True
-        for err in signals.autosync_errors:
+    elif signals.autosync_failed:
+        log_evidence.autosync_success = False
+    if signals.autosync_error_codes:
+        for err in signals.autosync_error_codes:
             cleaned = err.strip()
             if cleaned and cleaned not in log_evidence.autosync_errors:
                 log_evidence.autosync_errors.append(cleaned)
         if len(log_evidence.autosync_errors) > 12:
-            del log_evidence.autosync_errors[12:]
-    log_evidence.tv_volume_events = log_evidence.tv_volume_events or signals.tv_volume_events
-    log_evidence.tv_osd_events = log_evidence.tv_osd_events or signals.tv_osd_events
+            log_evidence.autosync_errors = log_evidence.autosync_errors[-12:]
+    if signals.tv_volume_events:
+        log_evidence.tv_volume_events = True
     if signals.tv_osd_events:
+        log_evidence.tv_osd_events = True
         log_evidence.osd_tv = True
-    log_evidence.ir_commands_sent = log_evidence.ir_commands_sent or signals.ir_commands_sent
-    log_evidence.cec_events_detected = log_evidence.cec_events_detected or signals.cec_events_detected
-    if signals.volume_source_events:
-        log_evidence.volume_source_history.extend(signals.volume_source_events)
-        if len(log_evidence.volume_source_history) > 60:
-            log_evidence.volume_source_history = log_evidence.volume_source_history[-60:]
-        last_source = next(
-            (src for src in reversed(log_evidence.volume_source_history) if src in {"TV", "STB"}),
-            None,
-        )
-        if last_source:
-            log_evidence.volume_source = last_source
+    if signals.stb_osd_events:
+        log_evidence.osd_stb = True
     if signals.stb_volume_events:
         log_evidence.stb_volume_events = True
+    if signals.volume_source_history:
+        log_evidence.volume_source_history.extend(signals.volume_source_history)
+        if len(log_evidence.volume_source_history) > 60:
+            log_evidence.volume_source_history = log_evidence.volume_source_history[-60:]
+    final_source = signals.volume_source_final
+    if final_source and final_source != "UNKNOWN":
+        log_evidence.volume_source = final_source
+    elif (
+        not log_evidence.volume_source
+        and signals.volume_source_initial
+        and signals.volume_source_initial != "UNKNOWN"
+    ):
+        log_evidence.volume_source = signals.volume_source_initial
     if signals.tv_config_events:
         for entry in signals.tv_config_events:
             if entry not in log_evidence.tv_config_events:
                 log_evidence.tv_config_events.append(entry)
         if len(log_evidence.tv_config_events) > 12:
             log_evidence.tv_config_events = log_evidence.tv_config_events[-12:]
-    log_evidence.tv_config_seen = log_evidence.tv_config_seen or signals.tv_config_seen
-    log_evidence.tv_config_cleared_during_run = (
-        log_evidence.tv_config_cleared_during_run or signals.tv_config_cleared_during_run
-    )
-
-
-def detect_autosync_from_events(events: List[Dict[str, Any]]) -> tuple[bool, bool]:
-    started = False
-    success = False
-    for ev in events:
-        step = str(ev.get("step_name") or "")
-        step_upper = step.upper()
-        details = ev.get("details") or {}
-        tags = [
-            str(tag).lower()
-            for tag in (details.get("tags") or [])
-            if isinstance(tag, str)
-        ]
-        signatures = details.get("matched_signatures") or []
-        sig_has_autosync = False
-        for sig in signatures:
-            sig_id = str(sig.get("id") or "").upper()
-            sig_tags = [
-                str(tag).lower()
-                for tag in (sig.get("tags") or [])
-                if isinstance(tag, str)
-            ]
-            if sig_id.startswith("AUTOSYNC") or "autosync" in sig_tags:
-                sig_has_autosync = True
-                break
-        event_autosync = (
-            "AUTOSYNC" in step_upper
-            or sig_has_autosync
-            or "autosync" in tags
-        )
-        if not event_autosync:
-            continue
-        started = True
-        state = details.get("state") or {}
-        terminal_state = str(state.get("terminal_state") or "").upper()
-        matched_success = state.get("matched_success") or []
-        success_from_state = (
-            terminal_state == "SUCCESS"
-            and (
-                sig_has_autosync
-                or any(str(item).upper().startswith("AUTOSYNC") for item in matched_success)
-            )
-        )
-        status_upper = str(ev.get("status") or "").upper()
-        success_from_status = sig_has_autosync and status_upper == "PASS"
-        if success_from_state or success_from_status:
-            success = True
-    return started, success
+    if signals.tv_config_seen:
+        log_evidence.tv_config_seen = True
+    if signals.tv_config_cleared_during_run:
+        log_evidence.tv_config_cleared_during_run = True
 
 
 # ----------------------- PUBLIC ENTRYPOINT ----------------------- #
@@ -511,14 +517,10 @@ def build_timeline_and_summary(
     user_answers = _extract_user_answers(raw_events)
     volume_probe = _extract_volume_probe(raw_events, user_answers)
     log_brand = _derive_log_brand(before_snap, after_snap, raw_events)
-    event_autosync_started, event_autosync_success = detect_autosync_from_events(raw_events)
     log_text = load_logcat_text(session_id)
-    log_lines = log_text.splitlines()
     log_evidence = analyze_log_evidence(log_text, log_brand)
-    log_signals = extract_quickset_log_signals(log_lines)
+    log_signals = parse_quickset_logs(log_text)
     _merge_quickset_signals(log_evidence, log_signals)
-    log_evidence.autosync_started = event_autosync_started or log_evidence.autosync_started
-    log_evidence.autosync_success = event_autosync_success or log_evidence.autosync_success
 
     resolved_scenario_name = scenario_name or "UNKNOWN"
     if not resolved_scenario_name or resolved_scenario_name.upper() == "UNKNOWN":
@@ -1356,57 +1358,6 @@ def _compute_overall_status(rows: List[StepRow]) -> StepStatus:
     return StepStatus.PASS
 
 
-def _volume_probe_metadata_present(row: Optional[StepRow]) -> bool:
-    if not row:
-        return False
-    for key in ("volume_probe_state", "volume_probe_source", "volume_probe_detection_state", "volume_probe_confidence"):
-        if key not in row.details:
-            continue
-        value = row.details.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str):
-            if value.strip():
-                return True
-        else:
-            return True
-    return False
-
-
-def _timeline_has_probe_event(raw_events: List[Dict[str, Any]], timeline_rows: List[StepRow]) -> bool:
-    probe_names = {name.lower() for name in PROBE_EVENT_NAMES}
-    for row in timeline_rows:
-        if row.name.lower() in probe_names:
-            return True
-    for event in raw_events:
-        step_name = str(event.get("step_name") or "").strip().lower()
-        if step_name in probe_names:
-            return True
-    return False
-
-
-def _has_autosync_signal(
-    *,
-    tv_brand_log: Optional[str],
-    log_evidence: LogEvidence,
-    volume_row: Optional[StepRow],
-    tv_control_evidence: bool,
-    raw_events: List[Dict[str, Any]],
-    timeline_rows: List[StepRow],
-) -> bool:
-    if tv_brand_log or log_evidence.log_brand:
-        return True
-    if _volume_probe_metadata_present(volume_row):
-        return True
-    if log_evidence.volume_source:
-        return True
-    if tv_control_evidence or log_evidence.osd_tv or log_evidence.osd_stb:
-        return True
-    if _timeline_has_probe_event(raw_events, timeline_rows):
-        return True
-    return False
-
-
 def _normalize_volume_source(value: Optional[str]) -> str:
     if value is None:
         return "UNKNOWN"
@@ -1529,6 +1480,7 @@ def _build_analysis_details(
     brand_mismatch: bool,
     autosync_never_started: bool,
     autosync_failed: bool,
+    logs_inconclusive_for_autosync: bool,
     probe_state: str,
     probe_confidence: float,
 ) -> Tuple[List[FailureInsight], Dict[str, Any], List[str], str]:
@@ -1585,6 +1537,13 @@ def _build_analysis_details(
             "autosync_not_completed",
             "QuickSet logs show TV auto-sync started but not completed successfully.",
         )
+    if logs_inconclusive_for_autosync:
+        _add_root_cause(
+            root_causes,
+            recs,
+            "autosync_logs_inconclusive",
+            "Logs did not contain QuickSet or volume/OSD signals; relying on tester verdict.",
+        )
     if brand_mismatch:
         _add_root_cause(
             root_causes,
@@ -1621,6 +1580,8 @@ def _build_analysis_details(
         "tv_config_events": list(log_evidence.tv_config_events[-6:]),
         "volume_source_history": list(log_evidence.volume_source_history[-6:]),
     }
+    if log_evidence.log_signals:
+        evidence_block["log_signals"] = log_evidence.log_signals.model_dump(mode="json")
 
     contradiction_detected = any(
         bool(row and row.details.get("issue_confirmed_by_probe")) for row in (volume_row, osd_row)
@@ -1727,18 +1688,16 @@ def _build_session_summary(
         brand_row.details.get("tv_brand_log") if brand_row else log_brand
     )
 
-    if (
-        not log_evidence.autosync_started
-        and _has_autosync_signal(
-            tv_brand_log=tv_brand_log,
-            log_evidence=log_evidence,
-            volume_row=volume_row,
-            tv_control_evidence=tv_control_evidence,
-            raw_events=raw_events,
-            timeline_rows=timeline_rows,
-        )
-    ):
-        log_evidence.autosync_started = True
+    autosync_logs = _evaluate_autosync_from_logs(log_evidence.log_signals)
+    log_evidence.autosync_started = autosync_logs.autosync_started
+    log_evidence.autosync_success = autosync_logs.autosync_success
+    logs_inconclusive_for_autosync = autosync_logs.logs_inconclusive
+    strong_log_fail = (
+        autosync_logs.autosync_started
+        and not autosync_logs.autosync_success
+        and autosync_logs.autosync_failed
+    )
+    strong_log_pass = autosync_logs.autosync_started and autosync_logs.autosync_success
 
     _apply_axis_timeline_status(
         volume_row,
@@ -1763,8 +1722,8 @@ def _build_session_summary(
     functional_pass = volume_yes and osd_yes and pairing_yes
     tester_fail = tester_fail_volume or tester_fail_osd or tester_fail_pairing
     tester_verdict = "PASS" if functional_pass else ("FAIL" if tester_fail else "UNKNOWN")
-    autosync_never_started = final_stage and not log_evidence.autosync_started
-    autosync_failed = final_stage and log_evidence.autosync_started and not log_evidence.autosync_success
+    autosync_never_started = final_stage and not autosync_logs.autosync_started and not logs_inconclusive_for_autosync
+    autosync_failed = final_stage and strong_log_fail
     telemetry_confident_failure = telemetry_state == "STB_CONTROL_CONFIDENT"
     telemetry_inconclusive = telemetry_state == "UNKNOWN"
     pass_summary_prefix = (
@@ -1778,16 +1737,22 @@ def _build_session_summary(
     elif telemetry_confident_failure:
         log_verdict = "FAIL"
         log_failure_reason = "Telemetry indicates STB is controlling volume/OSD despite tester confirmation."
-    elif autosync_failed:
+    elif strong_log_fail:
         log_verdict = "FAIL"
         log_failure_reason = "Auto-sync did not complete successfully in logs."
+    elif logs_inconclusive_for_autosync:
+        log_verdict = "INCONCLUSIVE"
+        log_failure_reason = "Logs were inconclusive for auto-sync; relying on tester answers."
     elif telemetry_inconclusive:
         log_verdict = "INCONCLUSIVE"
         log_failure_reason = None
-    else:
+    elif strong_log_pass:
         log_verdict = "PASS"
         log_failure_reason = None
-    conflict_tester_vs_logs = functional_pass and log_verdict == "FAIL"
+    else:
+        log_verdict = "INCONCLUSIVE"
+        log_failure_reason = None
+    conflict_tester_vs_logs = functional_pass and strong_log_fail
 
     if not analyzer_ready:
         overall = StepStatus.AWAITING_INPUT
@@ -1815,7 +1780,10 @@ def _build_session_summary(
     else:
         overall = StepStatus.PASS
         if log_verdict == "INCONCLUSIVE":
-            analysis_text = pass_summary_prefix + "Telemetry probe was inconclusive – no TV responses observed."
+            if logs_inconclusive_for_autosync:
+                analysis_text = pass_summary_prefix + "Logs were inconclusive for auto-sync; relying on tester answers."
+            else:
+                analysis_text = pass_summary_prefix + "Telemetry probe was inconclusive – no TV responses observed."
         else:
             analysis_text = "TV auto-sync completed successfully with no detected issues."
 
@@ -1836,8 +1804,8 @@ def _build_session_summary(
     positive_volume_signal = volume_yes and not has_volume_issue
     positive_osd_signal = osd_yes and not has_osd_issue
     final_autosync_success = (
-        log_evidence.autosync_started
-        and log_evidence.autosync_success
+        autosync_logs.autosync_started
+        and autosync_logs.autosync_success
         and positive_volume_signal
         and positive_osd_signal
         and not brand_mismatch
@@ -1861,6 +1829,7 @@ def _build_session_summary(
         brand_mismatch=brand_mismatch,
         autosync_never_started=autosync_never_started,
         autosync_failed=autosync_failed,
+        logs_inconclusive_for_autosync=logs_inconclusive_for_autosync,
         probe_state=volume_probe_state,
         probe_confidence=probe_confidence,
     )
@@ -1889,7 +1858,7 @@ def _build_session_summary(
         summary_row.details["analysis"] = analysis_text
         summary_row.details["failed_steps"] = failed_steps
         summary_row.details["awaiting_steps"] = awaiting_steps
-        summary_row.details["autosync_started"] = log_evidence.autosync_started
+        summary_row.details["autosync_started"] = autosync_logs.autosync_started
         summary_row.details["autosync_success"] = final_autosync_success
         summary_row.details["failure_insights"] = [ins.model_dump(mode="json") for ins in failure_insights]
         summary_row.details["evidence"] = evidence_block

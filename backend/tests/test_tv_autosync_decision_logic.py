@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import List, Set
 
+from backend.app.quickset_log_parser import QuicksetLogSignals
 from backend.quickset_timeline_analyzer import (
     StepRow,
     StepStatus,
     LogEvidence,
     _build_session_summary,
+    _merge_quickset_signals,
 )
 
 
@@ -627,3 +629,106 @@ def test_tv_auto_sync_tester_no_volume_forces_fail() -> None:
     assert summary.has_volume_issue is True
     assert summary.analysis_text.startswith("TV auto-sync failed: tester did not observe TV volume change.")
     assert any(ins.code == "tester_saw_no_volume_change" for ins in analyzer_result.failure_insights)
+
+
+def test_analysis_details_include_log_signals_payload() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+            details={"volume_probe_detection_state": "tv_control"},
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="LG",
+            details={
+                "tv_brand_user": "LG",
+                "tv_brand_log": "LG",
+                "brand_mismatch": False,
+            },
+        ),
+    ]
+    log_evidence = LogEvidence()
+    signals = QuicksetLogSignals(
+        autosync_started=True,
+        autosync_completed_successfully=True,
+        volume_source_initial="STB",
+        volume_source_final="TV",
+        tv_volume_events=2,
+        tv_osd_events=1,
+        tv_brand_inferred="LG",
+    )
+    _merge_quickset_signals(log_evidence, signals)
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="LG")
+
+    assert summary.overall_status == StepStatus.PASS
+    assert "log_signals" in analyzer_result.evidence
+    log_signals = analyzer_result.evidence["log_signals"]
+    assert log_signals["volume_source_final"] == "TV"
+    assert log_signals["tv_volume_events"] == 2
+
+
+def test_logs_inconclusive_rely_on_tester_pass_without_failures() -> None:
+    rows = [
+        StepRow(
+            name="question_tv_volume_changed",
+            label="TV volume changed",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_osd_seen",
+            label="TV OSD seen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_pairing_screen_seen",
+            label="Pairing screen",
+            status=StepStatus.PASS,
+            user_answer="yes",
+        ),
+        StepRow(
+            name="question_tv_brand_ui",
+            label="TV brand (UI vs log)",
+            status=StepStatus.PASS,
+            user_answer="Samsung",
+            details={
+                "tv_brand_user": "Samsung",
+                "tv_brand_log": "Samsung",
+                "brand_mismatch": False,
+            },
+        ),
+    ]
+    log_evidence = LogEvidence()
+    signals = QuicksetLogSignals()
+    _merge_quickset_signals(log_evidence, signals)
+
+    summary, analyzer_result = _run_summary(rows, log_evidence, log_brand="Samsung")
+
+    assert summary.overall_status == StepStatus.PASS
+    assert summary.has_failure is False
+    assert "Auto-sync did not complete successfully in logs." not in summary.analysis_text
+    evidence_log_signals = analyzer_result.evidence["log_signals"]
+    assert evidence_log_signals["autosync_started"] is False
+    codes = {ins.code: ins for ins in analyzer_result.failure_insights}
+    assert "autosync_not_completed" not in codes
+    assert "autosync_logs_inconclusive" in codes
+    assert codes["autosync_logs_inconclusive"].category == "tooling"
