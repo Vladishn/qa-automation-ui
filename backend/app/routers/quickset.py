@@ -43,7 +43,11 @@ from src.adb.adb_client import ADBClient  # noqa: E402
 from src.qa.step_logger import StepLogger  # noqa: E402
 from src.quickset.scenarios.tv_auto_sync import TvAutoSyncScenario  # noqa: E402
 
-from ..live_button_workflow import configure_live_mapping, live_phase_press
+from ..live_button_workflow import (
+    configure_live_mapping,
+    ensure_device_focus_ready,
+    live_phase_press,
+)
 
 RAW_LOG_DIR = PROJECT_ROOT / "artifacts" / "quickset_logs"
 LIVE_LOG_DIR = PROJECT_ROOT / "backend" / "artifacts" / "live_logs"
@@ -191,7 +195,11 @@ def _build_tv_autosync_envelope(
     *,
     include_runtime: bool,
 ) -> Tuple[TvAutoSyncSessionResponse, bool]:
-    analyzer_payload = _load_analyzer_payload(session.session_id, session.scenario_name)
+    try:
+        analyzer_payload = _load_analyzer_payload(session.session_id, session.scenario_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("QuickSet analyzer failed for %s: %s", session.session_id, exc)
+        analyzer_payload = _build_analyzer_error_payload(session, exc)
     analyzer_ready = False
 
     if analyzer_payload:
@@ -268,6 +276,118 @@ def _build_pending_summary(session: QuickSetRuntimeSession) -> TvAutoSyncSession
         notes=None,
         analyzer_ready=False,
     )
+
+
+def _build_analyzer_error_payload(
+    session: QuickSetRuntimeSession,
+    error: Exception,
+) -> Dict[str, Any]:
+    analysis_text = f"Analyzer error: {error}"
+    summary = TvAutoSyncSession(
+        session_id=session.session_id,
+        scenario_name=session.scenario_name,
+        started_at=_to_iso(session.start_time),
+        finished_at=_to_iso(session.end_time),
+        overall_status="INCONCLUSIVE",
+        has_failure=False,
+        brand_mismatch=False,
+        tv_brand_user=None,
+        tv_brand_log=None,
+        has_volume_issue=False,
+        has_osd_issue=False,
+        analysis_text=analysis_text,
+        notes=None,
+        analyzer_ready=False,
+    )
+    failure_insight = {
+        "code": "analyzer_error",
+        "category": "tooling",
+        "severity": "high",
+        "title": "Analyzer error",
+        "description": analysis_text,
+    }
+    timeline_rows = _convert_steps_to_timeline(session.steps)
+    has_summary_row = any(row.get("name") == "analysis_summary" for row in timeline_rows)
+    if not has_summary_row:
+        timeline_rows.append(
+            TvAutoSyncTimelineEvent(
+                name="analysis_summary",
+                label="Scenario summary",
+                status="INCONCLUSIVE",
+                timestamp=_to_iso(session.end_time),
+                details={"analysis": analysis_text},
+            ).model_dump(mode="json", by_alias=True)
+        )
+    analysis_result = {
+        "overall_status": "INCONCLUSIVE",
+        "analysis_text": analysis_text,
+        "failure_insights": [failure_insight],
+        "has_failure": False,
+        "evidence": {},
+        "recommendations": [],
+        "awaiting_steps": [],
+        "failed_steps": [],
+        "confidence": "low",
+    }
+    return {
+        "session": summary.model_dump(mode="json", by_alias=True),
+        "timeline": timeline_rows,
+        "analysis_result": analysis_result,
+        "has_failure": False,
+    }
+
+
+def _convert_steps_to_timeline(steps: List[QuickSetStep]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    ordered_steps = sorted(steps, key=lambda s: s.timestamp or datetime.utcnow())
+    for step in ordered_steps:
+        metadata = dict(step.metadata or {})
+        timestamp = step.timestamp.isoformat() if step.timestamp else None
+        events.append(
+            {
+                "name": step.name,
+                "label": _friendly_label_for_step(step.name),
+                "status": _normalize_timeline_status(step.status),
+                "timestamp": timestamp,
+                "question": metadata.get("question"),
+                "user_answer": metadata.get("answer") or metadata.get("user_answer"),
+                "details": metadata,
+            }
+        )
+    return events
+
+
+def _friendly_label_for_step(name: str) -> str:
+    mapping = {
+        "adb_precheck": "ADB precheck",
+        "test_started": "Test started",
+        "test_completed": "Test completed",
+        "analysis_summary": "Scenario summary",
+        "logcat_capture_start": "Logcat capture start",
+        "logcat_capture_stop": "Logcat capture stop",
+        "configure_live_mapping": "Configure Live button mapping",
+        "phase1_live_press": "Phase 1: Live press",
+        "phase2_kill_and_relaunch": "Phase 2: Kill + press",
+        "phase3_reboot_persist": "Phase 3: Reboot + press",
+        "device_focus_precheck": "Device focus precheck",
+        "live_expected_channel": "Expected channel",
+    }
+    return mapping.get(name, name.replace("_", " ").title())
+
+
+def _normalize_timeline_status(value: Optional[str]) -> str:
+    if not value:
+        return "INFO"
+    normalized = value.strip().upper()
+    if normalized in {"PASS", "FAIL", "INFO", "RUNNING", "PENDING", "INCONCLUSIVE", "AWAITING_INPUT"}:
+        return normalized
+    if normalized in {"SUCCESS", "OK"}:
+        return "PASS"
+    if normalized in {"ERROR"}:
+        return "FAIL"
+    if normalized == "START":
+        return "INFO"
+    return "INFO"
 
 
 def _is_analyzer_ready(summary: TvAutoSyncSession, timeline: List[TvAutoSyncTimelineEvent]) -> bool:
@@ -395,61 +515,74 @@ def _execute_tv_auto_sync(session_id: str, tester_id: str, stb_ip: str) -> None:
     step_logger = QuickSetStepLogger(session_id=session_id, output_dir=STEP_LOG_DIR)
     quickset_session_store.set_state(session_id, "running")
 
-    precheck_result = _run_adb_precheck(session_id, step_logger, stb_ip)
-    if precheck_result.status is not AdbPrecheckStatus.OK:
-        return
-
-    logcat_path = raw_dir / f"{session_id}_tv_auto_sync.log"
-    final_status = "fail"
-
     try:
-        adb_client = ADBClient(stb_ip)
-        scenario = TvAutoSyncScenario(
-            adb_client=adb_client,
-            step_logger=step_logger,
-            knowledge_path=KNOWLEDGE_PATH,
-            raw_log_dir=raw_dir,
-            session_id=session_id,
-        )
-        ask_fn = _make_ask(session_id, step_logger)
-        result = scenario.run(ask=ask_fn)
-        status_value = (result.get("status") or "").strip().lower()
-        final_status = "pass" if status_value == "pass" else "fail"
-        analysis = result.get("analysis")
-        if analysis:
-            step_logger.log_step("analysis_summary", "INFO", {"analysis": analysis})
-    except Exception as exc:  # noqa: BLE001
-        step_logger.log_step("scenario_exception", "FAIL", {"error": str(exc)})
+        precheck_result = _run_adb_precheck(session_id, step_logger, stb_ip)
+        if precheck_result.status is not AdbPrecheckStatus.OK:
+            step_logger.log_step(
+                "test_completed",
+                "FAIL",
+                {"tester_visible": False, "reason": "adb_precheck_failed"},
+            )
+            return
+
+        logcat_path = raw_dir / f"{session_id}_tv_auto_sync.log"
         final_status = "fail"
+
+        try:
+            adb_client = ADBClient(stb_ip)
+            scenario = TvAutoSyncScenario(
+                adb_client=adb_client,
+                step_logger=step_logger,
+                knowledge_path=KNOWLEDGE_PATH,
+                raw_log_dir=raw_dir,
+                session_id=session_id,
+            )
+            ask_fn = _make_ask(session_id, step_logger)
+            result = scenario.run(ask=ask_fn)
+            status_value = (result.get("status") or "").strip().lower()
+            final_status = "pass" if status_value == "pass" else "fail"
+            analysis = result.get("analysis")
+            if analysis:
+                step_logger.log_step("analysis_summary", "INFO", {"analysis": analysis})
+        except Exception as exc:  # noqa: BLE001
+            step_logger.log_step("scenario_exception", "FAIL", {"error": str(exc)})
+            final_status = "fail"
+
+        adb_log = _read_text(step_logger.log_path)
+        logcat_log = _read_text(logcat_path)
+
+        tv_model = _extract_tv_model_from_text(logcat_log)
+        if tv_model:
+            quickset_session_store.set_tv_model(session_id, tv_model)
+
+        remote_keys = _extract_remote_keys(logcat_log)
+        if remote_keys:
+            quickset_session_store.set_remote_keys(session_id, remote_keys)
+
+        snapshot = quickset_session_store.get_session(session_id)
+        final_summary = ""
+        if snapshot:
+            evidence = _collect_session_evidence(snapshot)
+            decision_result, decision_summary = compute_quickset_result(*evidence)
+            final_status = decision_result
+            final_summary = decision_summary
+            _sync_analysis_summary_step(session_id, snapshot.steps, final_status, final_summary)
+
+        completion_status = "PASS" if final_status.lower() == "pass" else "FAIL"
+        step_logger.log_step(
+            "test_completed",
+            completion_status,
+            {"tester_visible": False, "analysis": final_summary or final_status.upper()},
+        )
+
+        quickset_session_store.finalize_session(
+            session_id,
+            result=final_status,
+            logs={"adb": adb_log, "logcat": logcat_log},
+            summary=final_summary or None,
+        )
     finally:
         step_logger.close()
-
-    adb_log = _read_text(step_logger.log_path)
-    logcat_log = _read_text(logcat_path)
-
-    tv_model = _extract_tv_model_from_text(logcat_log)
-    if tv_model:
-        quickset_session_store.set_tv_model(session_id, tv_model)
-
-    remote_keys = _extract_remote_keys(logcat_log)
-    if remote_keys:
-        quickset_session_store.set_remote_keys(session_id, remote_keys)
-
-    snapshot = quickset_session_store.get_session(session_id)
-    final_summary = ""
-    if snapshot:
-        evidence = _collect_session_evidence(snapshot)
-        decision_result, decision_summary = compute_quickset_result(*evidence)
-        final_status = decision_result
-        final_summary = decision_summary
-        _sync_analysis_summary_step(session_id, snapshot.steps, final_status, final_summary)
-
-    quickset_session_store.finalize_session(
-        session_id,
-        result=final_status,
-        logs={"adb": adb_log, "logcat": logcat_log},
-        summary=final_summary or None,
-    )
 
 
 def _execute_live_button_mapping(
@@ -462,10 +595,6 @@ def _execute_live_button_mapping(
     raw_dir.mkdir(parents=True, exist_ok=True)
     step_logger = QuickSetStepLogger(session_id=session_id, output_dir=STEP_LOG_DIR)
     quickset_session_store.set_state(session_id, "running")
-
-    precheck_result = _run_adb_precheck(session_id, step_logger, stb_ip)
-    if precheck_result.status is not AdbPrecheckStatus.OK:
-        return
 
     logcat_path = LIVE_LOG_DIR / f"live_{session_id}.log"
     final_status = "fail"
@@ -488,165 +617,197 @@ def _execute_live_button_mapping(
     )
 
     try:
-        step_logger.log_step(
-            "logcat_capture_start",
-            "INFO",
-            {"log_path": str(logcat_path), "tester_visible": False},
-        )
+        precheck_result = _run_adb_precheck(session_id, step_logger, stb_ip)
+        if precheck_result.status is not AdbPrecheckStatus.OK:
+            step_logger.log_step(
+                "test_completed",
+                "FAIL",
+                {"tester_visible": False, "reason": "adb_precheck_failed"},
+            )
+            return
+
         try:
-            logcat_path, live_log_proc, live_log_handle = _start_live_log_capture(adb_client, session_id)
-            logcat_started = True
+            try:
+                adb_client.shell("logcat -c", check=False)
+            except Exception:
+                pass
             step_logger.log_step(
                 "logcat_capture_start",
-                "PASS",
+                "INFO",
                 {"log_path": str(logcat_path), "tester_visible": False},
             )
-
-            def _restart_live_log_capture_inner() -> None:
-                nonlocal live_log_proc, live_log_handle, logcat_path, logcat_started
-                try:
-                    _stop_live_log_capture(live_log_proc, live_log_handle)
-                except Exception:
-                    pass
-                logcat_path, live_log_proc, live_log_handle = _start_live_log_capture(
-                    adb_client,
-                    session_id,
-                    append=True,
-                    existing_path=logcat_path,
-                )
+            try:
+                logcat_path, live_log_proc, live_log_handle = _start_live_log_capture(adb_client, session_id)
                 logcat_started = True
-
-            restart_live_log_capture_cb = _restart_live_log_capture_inner
-
-        except Exception as exc:  # noqa: BLE001
-            step_logger.log_step(
-                "logcat_capture_start",
-                "FAIL",
-                {"error": str(exc), "log_path": str(logcat_path), "tester_visible": False},
-            )
-            raise
-
-        phase_steps = [
-            ("phase1_live_press", "PHASE1", {"do_force_stop": False, "do_reboot": False}),
-            ("phase2_kill_and_relaunch", "PHASE2", {"do_force_stop": True, "do_reboot": False}),
-            (
-                "phase3_reboot_persist",
-                "PHASE3",
-                {
-                    "do_force_stop": False,
-                    "do_reboot": True,
-                    "post_reboot_callback": restart_live_log_capture_cb,
-                },
-            ),
-        ]
-
-        step_logger.log_step(
-            "configure_live_mapping",
-            "RUNNING",
-            {"expected_channel": expected_channel, "tester_visible": False},
-        )
-        try:
-            configure_live_mapping(adb_client, expected_channel)
-            step_logger.log_step(
-                "configure_live_mapping",
-                "PASS",
-                {"expected_channel": expected_channel, "tester_visible": False},
-            )
-        except Exception as exc:
-            step_logger.log_step(
-                "configure_live_mapping",
-                "FAIL",
-                {"expected_channel": expected_channel, "error": str(exc), "tester_visible": False},
-            )
-            _mark_live_phases_skipped(step_logger, phase_steps, expected_channel, str(exc))
-            raise
-
-        for step_name, phase_label, options in phase_steps:
-            step_logger.log_step(
-                step_name,
-                "RUNNING",
-                {"expected_channel": expected_channel, "phase": phase_label, "tester_visible": False},
-            )
-            try:
-                live_phase_press(
-                    adb_client,
-                    phase_label,
-                    expected_channel,
-                    do_force_stop=options.get("do_force_stop", False),
-                    do_reboot=options.get("do_reboot", False),
-                    post_reboot_callback=options.get("post_reboot_callback"),
-                )
                 step_logger.log_step(
-                    step_name,
-                    "PASS",
-                    {"expected_channel": expected_channel, "phase": phase_label, "tester_visible": False},
-                )
-            except Exception as exc:
-                step_logger.log_step(
-                    step_name,
-                    "FAIL",
-                    {
-                        "expected_channel": expected_channel,
-                        "phase": phase_label,
-                        "error": str(exc),
-                        "tester_visible": False,
-                    },
-                )
-                raise
-
-        final_summary = (
-            f"Live button automation completed for expected channel {expected_channel}. "
-            "Analyzer will determine the final verdict from logs."
-        )
-        final_status = "pass"
-    except Exception as exc:  # noqa: BLE001
-        final_summary = f"Live button automation failed: {exc}"
-        step_logger.log_step("scenario_exception", "FAIL", {"error": str(exc)})
-        final_status = "fail"
-    finally:
-        if logcat_started:
-            try:
-                _stop_live_log_capture(live_log_proc, live_log_handle)
-                step_logger.log_step(
-                    "logcat_capture_stop",
+                    "logcat_capture_start",
                     "PASS",
                     {"log_path": str(logcat_path), "tester_visible": False},
                 )
+
+                def _restart_live_log_capture_inner() -> None:
+                    nonlocal live_log_proc, live_log_handle, logcat_path, logcat_started
+                    try:
+                        _stop_live_log_capture(live_log_proc, live_log_handle)
+                    except Exception:
+                        pass
+                    logcat_path, live_log_proc, live_log_handle = _start_live_log_capture(
+                        adb_client,
+                        session_id,
+                        append=True,
+                        existing_path=logcat_path,
+                    )
+                    logcat_started = True
+
+                restart_live_log_capture_cb = _restart_live_log_capture_inner
+
             except Exception as exc:  # noqa: BLE001
-                step_logger.log_step("logcat_capture_stop", "FAIL", {"error": str(exc)})
-        summary_status = "INFO" if final_status == "pass" else "FAIL"
-        step_logger.log_step(
-            "analysis_summary",
-            summary_status,
-            {"analysis": final_summary, "expected_channel": expected_channel, "tester_visible": False},
+                step_logger.log_step(
+                    "logcat_capture_start",
+                    "FAIL",
+                    {"error": str(exc), "log_path": str(logcat_path), "tester_visible": False},
+                )
+                raise
+
+            phase_steps = [
+                ("phase1_live_press", "PHASE1", {"do_force_stop": False, "do_reboot": False}),
+                ("phase2_kill_and_relaunch", "PHASE2", {"do_force_stop": True, "do_reboot": False}),
+                (
+                    "phase3_reboot_persist",
+                    "PHASE3",
+                    {
+                        "do_force_stop": False,
+                        "do_reboot": True,
+                        "post_reboot_callback": restart_live_log_capture_cb,
+                    },
+                ),
+            ]
+
+            step_logger.log_step(
+                "device_focus_precheck",
+                "RUNNING",
+                {"tester_visible": False},
+            )
+            try:
+                focused_pkg = ensure_device_focus_ready(adb_client, session_id)
+            except Exception as exc:  # noqa: BLE001
+                focused_pkg = f"error:{exc}"
+            focus_status = "PASS" if focused_pkg and focused_pkg != "unknown" else "INFO"
+            step_logger.log_step(
+                "device_focus_precheck",
+                focus_status,
+                {"focused_package": focused_pkg, "tester_visible": False},
+            )
+
+            step_logger.log_step(
+                "configure_live_mapping",
+                "RUNNING",
+                {"expected_channel": expected_channel, "tester_visible": False},
+            )
+            try:
+                configure_live_mapping(adb_client, session_id, expected_channel)
+                step_logger.log_step(
+                    "configure_live_mapping",
+                    "PASS",
+                    {"expected_channel": expected_channel, "tester_visible": False},
+                )
+            except Exception as exc:
+                step_logger.log_step(
+                    "configure_live_mapping",
+                    "FAIL",
+                    {"expected_channel": expected_channel, "error": str(exc), "tester_visible": False},
+                )
+                _mark_live_phases_skipped(step_logger, phase_steps, expected_channel, str(exc))
+                raise
+
+            for step_name, phase_label, options in phase_steps:
+                step_logger.log_step(
+                    step_name,
+                    "RUNNING",
+                    {"expected_channel": expected_channel, "phase": phase_label, "tester_visible": False},
+                )
+                try:
+                    live_phase_press(
+                        adb_client,
+                        session_id,
+                        phase_label,
+                        expected_channel,
+                        do_force_stop=options.get("do_force_stop", False),
+                        do_reboot=options.get("do_reboot", False),
+                        post_reboot_callback=options.get("post_reboot_callback"),
+                    )
+                    step_logger.log_step(
+                        step_name,
+                        "PASS",
+                        {"expected_channel": expected_channel, "phase": phase_label, "tester_visible": False},
+                    )
+                except Exception as exc:
+                    step_logger.log_step(
+                        step_name,
+                        "FAIL",
+                        {
+                            "expected_channel": expected_channel,
+                            "phase": phase_label,
+                            "error": str(exc),
+                            "tester_visible": False,
+                        },
+                    )
+                    raise
+
+            final_summary = (
+                f"Live button automation completed for expected channel {expected_channel}. "
+                "Analyzer will determine the final verdict from logs."
+            )
+            final_status = "pass"
+        except Exception as exc:  # noqa: BLE001
+            final_summary = f"Live button automation failed: {exc}"
+            step_logger.log_step("scenario_exception", "FAIL", {"error": str(exc)})
+            final_status = "fail"
+        finally:
+            if logcat_started:
+                try:
+                    _stop_live_log_capture(live_log_proc, live_log_handle)
+                    step_logger.log_step(
+                        "logcat_capture_stop",
+                        "PASS",
+                        {"log_path": str(logcat_path), "tester_visible": False},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    step_logger.log_step("logcat_capture_stop", "FAIL", {"error": str(exc)})
+            summary_status = "PASS" if final_status == "pass" else "FAIL"
+            step_logger.log_step(
+                "analysis_summary",
+                summary_status,
+                {"analysis": final_summary, "expected_channel": expected_channel, "tester_visible": False},
+            )
+            step_logger.log_step(
+                "test_completed",
+                summary_status,
+                {"expected_channel": expected_channel, "tester_visible": False},
+            )
+
+        adb_log = _read_text(step_logger.log_path)
+        logcat_log = _read_text(logcat_path)
+
+        remote_keys = _extract_remote_keys(logcat_log)
+        if remote_keys:
+            quickset_session_store.set_remote_keys(session_id, remote_keys)
+
+        if not final_summary:
+            final_summary = "Live Button Mapping run completed."
+
+        snapshot = quickset_session_store.get_session(session_id)
+        if snapshot:
+            _sync_analysis_summary_step(session_id, snapshot.steps, final_status, final_summary)
+
+        quickset_session_store.finalize_session(
+            session_id,
+            result=final_status,
+            logs={"adb": adb_log, "logcat": logcat_log},
+            summary=final_summary or None,
         )
-        step_logger.log_step(
-            "test_completed",
-            summary_status,
-            {"expected_channel": expected_channel, "tester_visible": False},
-        )
+    finally:
         step_logger.close()
-
-    adb_log = _read_text(step_logger.log_path)
-    logcat_log = _read_text(logcat_path)
-
-    remote_keys = _extract_remote_keys(logcat_log)
-    if remote_keys:
-        quickset_session_store.set_remote_keys(session_id, remote_keys)
-
-    if not final_summary:
-        final_summary = "Live Button Mapping run completed."
-
-    snapshot = quickset_session_store.get_session(session_id)
-    if snapshot:
-        _sync_analysis_summary_step(session_id, snapshot.steps, final_status, final_summary)
-
-    quickset_session_store.finalize_session(
-        session_id,
-        result=final_status,
-        logs={"adb": adb_log, "logcat": logcat_log},
-        summary=final_summary or None,
-    )
 
 
 def _read_text(path: Path) -> str:

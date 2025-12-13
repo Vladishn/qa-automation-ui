@@ -84,7 +84,7 @@ describe('QuickSetRunner scenario switching', () => {
     for (const key of Object.keys(sessionPayloads)) {
       delete sessionPayloads[key];
     }
-    mockUseSessionPolling.mockImplementation((sessionId: string | null) => {
+    mockUseSessionPolling.mockImplementation((sessionId: string | null, _apiKey: string | null) => {
       const data = sessionId ? sessionPayloads[sessionId] ?? null : null;
       return { data, error: null, setData: jest.fn() };
     });
@@ -129,6 +129,15 @@ describe('QuickSetRunner scenario switching', () => {
       session_id: 'LIVE_SESSION',
       scenario_name: 'LIVE_BUTTON_MAPPING'
     });
+    const livePayload = buildSessionPayload('LIVE_SESSION', 'LIVE_BUTTON_MAPPING');
+    livePayload.timeline.push({
+      name: 'live_expected_channel',
+      label: 'Expected channel',
+      status: 'PASS',
+      timestamp: '2024-01-01T00:00:05Z',
+      details: { expected_channel: 15 }
+    });
+    sessionPayloads.LIVE_SESSION = livePayload;
     render(<QuickSetRunner />);
 
     expect(screen.queryByLabelText('Expected channel')).not.toBeInTheDocument();
@@ -152,5 +161,40 @@ describe('QuickSetRunner scenario switching', () => {
         expectedChannel: 15
       })
     );
+    await waitFor(() =>
+      expect(screen.getByTestId('live-expected-channel-display')).toHaveTextContent('15')
+    );
+  });
+
+  it('hides pending tester input for live scenarios even if backend provides a question', async () => {
+    mockRunScenario.mockResolvedValue({
+      session_id: 'LIVE_SESSION',
+      scenario_name: 'LIVE_BUTTON_MAPPING'
+    });
+    const livePayload = buildSessionPayload('LIVE_SESSION', 'LIVE_BUTTON_MAPPING');
+    livePayload.quickset_session = {
+      ...livePayload.quickset_session,
+      pending_question: {
+        id: 'pending-1',
+        prompt: 'Should never show',
+        step_name: 'question_expected_channel',
+        input_kind: 'text',
+        metadata: {}
+      }
+    };
+    sessionPayloads.LIVE_SESSION = livePayload;
+
+    render(<QuickSetRunner />);
+    fireEvent.change(screen.getByLabelText('Scenario'), {
+      target: { value: 'LIVE_BUTTON_MAPPING' }
+    });
+    fireEvent.change(screen.getByLabelText('Expected channel'), { target: { value: '27' } });
+    fireEvent.change(screen.getByLabelText('Tester ID'), { target: { value: 'tester-live' } });
+    fireEvent.change(screen.getByLabelText('STB IP'), { target: { value: '10.0.0.9' } });
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'abc123' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Start test/i }));
+    await waitFor(() => expect(mockRunScenario).toHaveBeenCalled());
+    expect(screen.queryByText(/Pending Tester Input/i)).not.toBeInTheDocument();
   });
 });

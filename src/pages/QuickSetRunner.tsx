@@ -29,10 +29,6 @@ const RCU_SCENARIOS: ReadonlyArray<{ id: QuicksetScenarioId; label: string }> = 
   { id: 'LIVE_BUTTON_MAPPING', label: 'Live Button Mapping' }
 ];
 type TimelineRowWithStatus = TvAutoSyncTimelineEvent & { statusDisplay?: AnalyzerStepStatus | MetricTriState };
-const INITIAL_SESSION_HISTORY: Record<QuicksetScenarioId, string | null> = {
-  TV_AUTO_SYNC: null,
-  LIVE_BUTTON_MAPPING: null
-};
 const isFinalAnalyzerStatus = (value?: string | null): boolean => {
   if (!value) {
     return false;
@@ -60,6 +56,42 @@ const formatLogPreview = (value?: string | null, maxLines = 500): string => {
     `Showing last ${maxLines} lines of ${lines.length} total.`,
     ...lines.slice(-maxLines)
   ].join('\n');
+};
+
+const parseExpectedChannelValue = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const intValue = Math.trunc(value);
+    return intValue >= 0 ? intValue : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    return Number.isInteger(parsed) ? parsed : null;
+  }
+  return null;
+};
+
+const resolveTimelineExpectedChannel = (rows?: TvAutoSyncTimelineEvent[] | null): number | null => {
+  if (!rows?.length) {
+    return null;
+  }
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (row.name !== 'live_expected_channel') {
+      continue;
+    }
+    const details = (row.details ?? {}) as Record<string, unknown>;
+    const candidate =
+      parseExpectedChannelValue(details.expected_channel) ??
+      parseExpectedChannelValue(details.answer);
+    if (candidate !== null) {
+      return candidate;
+    }
+  }
+  return null;
 };
 
 const getStatusClass = (label: string): string => {
@@ -92,8 +124,6 @@ const pickTriState = (value: unknown): MetricTriState | undefined => {
 const QuickSetRunner: React.FC = () => {
   const [form, setForm] = useState(defaultForm);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [lastSessionByScenario, setLastSessionByScenario] =
-    useState<Record<QuicksetScenarioId, string | null>>(() => ({ ...INITIAL_SESSION_HISTORY }));
   const [activeApiKey, setActiveApiKey] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -114,6 +144,20 @@ const QuickSetRunner: React.FC = () => {
     analyzerSession &&
       (analyzerSession.finished_at || isFinalAnalyzerStatus(analyzerSession.overall_status))
   );
+  const timelineExpectedChannel = useMemo(
+    () => resolveTimelineExpectedChannel(timeline),
+    [timeline]
+  );
+  const expectedChannelDisplay = useMemo(() => {
+    if (selectedScenarioId !== 'LIVE_BUTTON_MAPPING') {
+      return null;
+    }
+    if (timelineExpectedChannel !== null) {
+      return timelineExpectedChannel.toString();
+    }
+    const formValue = parseExpectedChannelValue(form.expectedChannel);
+    return formValue !== null ? formValue.toString() : null;
+  }, [selectedScenarioId, timelineExpectedChannel, form.expectedChannel]);
 
   useEffect(() => {
     if (!selectedSessionId) {
@@ -169,10 +213,6 @@ const QuickSetRunner: React.FC = () => {
         scenarioName: selectedScenarioId,
         expectedChannel: expectedChannelValue
       });
-      setLastSessionByScenario((prev) => ({
-        ...prev,
-        [selectedScenarioId]: response.session_id
-      }));
       setSelectedSessionId(response.session_id);
       setActiveApiKey(trimmedKey);
       setSessionEnvelope(null);
@@ -223,15 +263,15 @@ const QuickSetRunner: React.FC = () => {
   const handleScenarioSelect = (event: React.ChangeEvent<HTMLSelectElement>) => {
     const nextScenario = event.target.value as QuicksetScenarioId;
     setSelectedScenarioId(nextScenario);
-    const nextSession = lastSessionByScenario[nextScenario] ?? null;
-    setSelectedSessionId(nextSession);
+    setSelectedSessionId(null);
     setSessionEnvelope(null);
+    setActiveApiKey(null);
     setAnswerText('');
+    setCompletionBanner(null);
+    setSubmitError(null);
+    setAnswerError(null);
     if (nextScenario === 'LIVE_BUTTON_MAPPING' && !form.expectedChannel) {
       setForm((prev) => ({ ...prev, expectedChannel: '3' }));
-    }
-    if (!nextSession) {
-      setCompletionBanner(null);
     }
   };
 
@@ -323,6 +363,9 @@ const QuickSetRunner: React.FC = () => {
   );
 
   const showLogs = analyzerSession?.has_failure === true;
+  const showPendingQuestion =
+    Boolean(pendingQuestion) &&
+    (runtimeSession?.scenario_name ?? selectedScenarioId) !== 'LIVE_BUTTON_MAPPING';
   const startedAt = formatDateTime(analyzerSession?.started_at);
   const finishedAt = formatDateTime(analyzerSession?.finished_at);
 
@@ -491,6 +534,14 @@ const QuickSetRunner: React.FC = () => {
                 {runtimeSession?.scenario_name || selectedScenarioId}
               </dd>
             </div>
+            {selectedScenarioId === 'LIVE_BUTTON_MAPPING' && (
+              <div>
+                <dt className="text-xs uppercase tracking-wide text-slate-400">Expected channel</dt>
+                <dd className="text-sm text-slate-100" data-testid="live-expected-channel-display">
+                  {expectedChannelDisplay ?? '—'}
+                </dd>
+              </div>
+            )}
             <div className="flex flex-col">
               <dt className="text-xs uppercase tracking-wide text-slate-400">Result</dt>
               <dd className="text-sm text-slate-100">
@@ -522,7 +573,7 @@ const QuickSetRunner: React.FC = () => {
             </div>
           )}
 
-          {pendingQuestion && (
+          {showPendingQuestion && pendingQuestion && (
             <div className="space-y-2">
               <h4 className="text-sm font-semibold">Pending Tester Input</h4>
               <p className="hint">{pendingQuestion.prompt}</p>

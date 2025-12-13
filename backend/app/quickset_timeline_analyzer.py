@@ -37,6 +37,7 @@ WHITELISTED_STEPS = {
     "question_notes",
     "question_expected_channel",
     "live_expected_channel",
+    "device_focus_precheck",
     "test_started",
     "configure_live_mapping",
     "phase1_live_press",
@@ -462,9 +463,15 @@ def load_live_button_log_text(session_id: str) -> str:
     return ""
 
 
-def _extract_live_log_excerpt(log_text: Optional[str]) -> Tuple[str, bool]:
+def _extract_live_log_excerpt(log_text: Optional[str], session_id: Optional[str] = None) -> Tuple[str, bool]:
     if not log_text:
         return "[no live log captured]", True
+    session_token = f"SESSION={session_id}" if session_id else None
+    if session_token and session_token in log_text:
+        idx = log_text.index(session_token)
+        start = max(0, idx - 200)
+        end = min(len(log_text), idx + 400)
+        return log_text[start:end].strip(), False
     for pattern in LIVE_LOG_SNIPPET_PATTERNS:
         match = pattern.search(log_text)
         if match:
@@ -678,7 +685,11 @@ def build_timeline_and_summary(
     )
 
     if upper_scenario == "LIVE_BUTTON_MAPPING":
-        live_signals = parse_live_button_logs(log_text, expected_channel_value)
+        live_signals = parse_live_button_logs(
+            log_text,
+            expected_channel_value,
+            session_id=session_id,
+        )
         summary, analyzer_result = _build_live_button_session_summary(
             session_id=session_id,
             scenario_name=resolved_scenario_name,
@@ -1205,6 +1216,7 @@ def _friendly_label(name: str) -> str:
         "question_notes": "Tester notes",
         "question_expected_channel": "Expected channel",
         "live_expected_channel": "Expected channel",
+        "device_focus_precheck": "Device focus precheck",
         "test_started": "Test started",
         "configure_live_mapping": "Configure Live button mapping",
         "phase1_live_press": "Phase 1: Live press",
@@ -1859,7 +1871,7 @@ def _build_live_button_session_summary(
         expected_row.user_answer = str(expected_value or expected_channel)
         expected_row.status = StepStatus.PASS
 
-    raw_excerpt_snippet, no_markers_found = _extract_live_log_excerpt(log_excerpt)
+    raw_excerpt_snippet, no_markers_found = _extract_live_log_excerpt(log_excerpt, session_id)
 
     def _collect_step_statuses() -> Tuple[List[str], List[str]]:
         awaiting = sorted(row.name for row in timeline_rows if row.status == StepStatus.AWAITING_INPUT)
@@ -1873,11 +1885,13 @@ def _build_live_button_session_summary(
         _add_root_cause(root_causes, recommendations, code, description)
 
     config_attempted = bool(getattr(live_signals, "config_attempted", False))
+    config_verified = bool(getattr(live_signals, "config_verified", False))
+    session_logs_found = bool(getattr(live_signals, "session_logs_found", True))
     phase_data_present = bool(live_signals and live_signals.phases)
     no_live_signals = (
         live_signals is None
         or (
-            live_signals.config_saved_channel is None
+            not session_logs_found
             and not phase_data_present
             and not config_attempted
         )
@@ -1899,7 +1913,9 @@ def _build_live_button_session_summary(
             "live_button_signals": {
                 "expected_channel": expected_channel,
                 "config_saved_channel": live_signals.config_saved_channel if live_signals else None,
-                 "config_attempted": config_attempted,
+                "config_attempted": config_attempted,
+                "config_verified": config_verified,
+                "session_logs_found": session_logs_found,
                 "phases": [
                     {
                         "phase": phase.phase,
@@ -1934,6 +1950,8 @@ def _build_live_button_session_summary(
         test_completed_row = _find_row(timeline_rows, "test_completed")
         if test_completed_row:
             test_completed_row.status = StepStatus.INCONCLUSIVE
+            if finished_at:
+                test_completed_row.timestamp = finished_at
 
         summary = SessionSummary(
             session_id=session_id,
@@ -1970,7 +1988,7 @@ def _build_live_button_session_summary(
 
     phases_by_name = {(phase.phase or "").upper(): phase for phase in live_signals.phases}
 
-    config_confirmed = (
+    config_confirmed = config_verified or (
         live_signals.config_saved_channel is not None
         and expected_channel is not None
         and live_signals.config_saved_channel == expected_channel
@@ -2043,14 +2061,15 @@ def _build_live_button_session_summary(
         overall = StepStatus.FAIL
         if config_attempted:
             analysis_text = (
-                f"Live button mapping failed: configuration attempt detected but logs never confirmed Saved channel "
-                f"{expected_channel}."
+                f"Live button mapping failed: automation could not confirm that the Live button field was set to "
+                f"channel {expected_channel}."
             )
             log_verdict = "INCONCLUSIVE"
             confidence = "low"
         else:
             analysis_text = (
-                f"Live button mapping failed: logs did not confirm Saved StingTV channel {expected_channel}."
+                "Live button mapping failed: configuration screen was not reached, so the expected channel "
+                f"{expected_channel} was never applied."
             )
             log_verdict = "FAIL"
             confidence = "high"
@@ -2081,6 +2100,8 @@ def _build_live_button_session_summary(
             "expected_channel": expected_channel,
             "config_saved_channel": live_signals.config_saved_channel,
             "config_attempted": config_attempted,
+            "config_verified": config_confirmed,
+            "session_logs_found": session_logs_found,
             "phases": [
                 {
                     "phase": phase.phase,
@@ -2116,6 +2137,8 @@ def _build_live_button_session_summary(
     test_completed_row = _find_row(timeline_rows, "test_completed")
     if test_completed_row:
         test_completed_row.status = overall
+        if finished_at:
+            test_completed_row.timestamp = finished_at
 
     summary = SessionSummary(
         session_id=session_id,
@@ -2414,6 +2437,12 @@ def _build_session_summary(
         summary_row.details["recommendations"] = recs
         summary_row.details["confidence"] = confidence
         summary_row.details["confidence_level"] = confidence
+
+    test_completed_row = next((r for r in timeline_rows if r.name == "test_completed"), None)
+    if test_completed_row:
+        test_completed_row.status = overall
+        if finished_at:
+            test_completed_row.timestamp = finished_at
 
     session_summary = SessionSummary(
         session_id=session_id,
