@@ -691,11 +691,15 @@ def _execute_live_button_mapping(
             try:
                 focused_pkg = ensure_device_focus_ready(adb_client, session_id)
             except Exception as exc:  # noqa: BLE001
-                focused_pkg = f"error:{exc}"
-            focus_status = "PASS" if focused_pkg and focused_pkg != "unknown" else "INFO"
+                step_logger.log_step(
+                    "device_focus_precheck",
+                    "FAIL",
+                    {"error": str(exc), "tester_visible": False},
+                )
+                raise
             step_logger.log_step(
                 "device_focus_precheck",
-                focus_status,
+                "PASS",
                 {"focused_package": focused_pkg, "tester_visible": False},
             )
 

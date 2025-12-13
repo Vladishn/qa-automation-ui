@@ -31,6 +31,7 @@ class LiveButtonSignals(BaseModel):
     config_attempted: bool = False
     config_verified: bool = False
     session_logs_found: bool = False
+    config_screen_detected: bool = False
 
     def get_phase(self, name: str) -> Optional[LiveButtonPhaseSignals]:
         for phase in self.phases:
@@ -98,6 +99,8 @@ def parse_live_button_logs(
             elif "LIVE_KEY_SENT" in upper:
                 phase = ensure_phase(current_phase or "PHASE1")
                 phase.live_key_pressed = True
+            elif "LIVE_CHANNEL_SCREEN_OK" in upper:
+                signals.config_screen_detected = True
             elif "CHANNEL_SET_RESULT" in upper:
                 signals.config_attempted = True
                 expected_match = re.search(r"EXPECTED\s*=\s*(\d+)", upper)

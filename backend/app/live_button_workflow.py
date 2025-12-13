@@ -14,18 +14,26 @@ SETTINGS_COMPONENT_CANDIDATES = (
     "com.google.android.tv.settings/.MainSettings",
     "com.android.tv.settings/.MainSettings",
 )
-HEBREW_PROMPT_TOKEN = "הזן את מספר הערוץ"
+GUIDANCE_PROMPT_TEXT = "הזן את מספר הערוץ המועדף עליך"
 GUIDANCE_TITLE_ID = "com.android.tv.settings:id/guidance_title"
 GUIDED_ACTION_EDIT_ID = "com.android.tv.settings:id/guidedactions_item_title"
-ALLOWED_FOCUS_PACKAGES = {
+SETTINGS_PACKAGE = "com.android.tv.settings"
+HOME_LAUNCHER_PACKAGES = {
     "com.google.android.tvlauncher",
     "com.google.android.tvlauncherx",
     "com.android.tvlauncher",
     "com.android.launcher",
+}
+ALLOWED_FOCUS_PACKAGES = {
+    *HOME_LAUNCHER_PACKAGES,
     "com.android.systemui",
-    "com.android.tv.settings",
+    SETTINGS_PACKAGE,
     LIVE_APP_PACKAGE,
 }
+THIRD_PARTY_APPS = (
+    "com.google.android.youtube.tv",
+    "com.netflix.ninja",
+)
 
 
 def configure_live_mapping(
@@ -37,6 +45,7 @@ def configure_live_mapping(
     settle_delay: float = 2.0,
 ) -> None:
     """Configure the Live button mapping through Android TV settings."""
+    _normalize_device_state(adb_client, session_id)
     _emit_marker(adb_client, session_id, f"CONFIG_START expected={expected_channel}")
     component = _prepare_settings_focus(adb_client, session_id)
     _emit_marker(adb_client, session_id, f"SETTINGS_FOCUSED package={component}")
@@ -55,24 +64,10 @@ def ensure_device_focus_ready(
     timeout: float = 20.0,
 ) -> str:
     """
-    Attempt to recover the device from a third-party app back to a controllable state.
-    This helper never raises solely because the focus is unknown; it best-effort recovers
-    and returns the latest package identifier (or 'unknown').
+    Normalizes the device so automation can safely open Settings.
+    Raises RuntimeError if the launcher/settings screen is not reached within timeout.
     """
-    deadline = time.time() + timeout
-    last_focus = "unknown"
-    while time.time() < deadline:
-        pkg = _detect_current_package(adb_client)
-        if pkg:
-            last_focus = pkg
-        if pkg and _is_allowed_focus_package(pkg):
-            return pkg
-        _emit_marker(adb_client, session_id, f"FOCUS_RECOVERY package={pkg or 'unknown'}")
-        _exit_to_home(adb_client)
-        component = _resolve_settings_component(adb_client)
-        _launch_live_button_settings(adb_client, component)
-        time.sleep(2.0)
-    return last_focus
+    return _normalize_device_state(adb_client, session_id, timeout=timeout)
 
 
 def live_phase_press(
@@ -113,6 +108,41 @@ def _emit_marker(adb_client: ADBClient, session_id: str, message: str) -> None:
     escaped = message.replace('"', '\\"')
     adb_client.shell(f'log -t {LIVE_LOG_TAG} "SESSION={session_id} {escaped}"', check=False)
     time.sleep(0.2)
+
+
+def _normalize_device_state(
+    adb_client: ADBClient,
+    session_id: str,
+    *,
+    timeout: float = 20.0,
+) -> str:
+    _emit_marker(adb_client, session_id, "DEVICE_NORMALIZE_START")
+    _force_stop_packages(adb_client, THIRD_PARTY_APPS)
+    _exit_to_home(adb_client)
+    time.sleep(0.5)
+    _exit_to_home(adb_client)
+    deadline = time.time() + timeout
+    last_pkg = "unknown"
+    while time.time() < deadline:
+        pkg = _detect_current_package(adb_client)
+        if pkg:
+            last_pkg = pkg
+        if pkg and (_is_home_package(pkg) or pkg.startswith(SETTINGS_PACKAGE)):
+            _emit_marker(adb_client, session_id, f"DEVICE_NORMALIZE_OK package={pkg}")
+            return pkg
+        _force_stop_packages(adb_client, THIRD_PARTY_APPS)
+        _exit_to_home(adb_client)
+        time.sleep(1.0)
+    _emit_marker(adb_client, session_id, f"DEVICE_NORMALIZE_FAIL package={last_pkg}")
+    raise RuntimeError(f"Device not in controllable state (focus={last_pkg}).")
+
+
+def _force_stop_packages(adb_client: ADBClient, packages: Sequence[str]) -> None:
+    for pkg in packages:
+        try:
+            adb_client.shell(f"am force-stop {pkg}", check=False)
+        except Exception:
+            continue
 
 
 def _prepare_settings_focus(adb_client: ADBClient, session_id: str) -> str:
@@ -348,6 +378,11 @@ def _is_allowed_focus_package(pkg: str) -> bool:
     return any(allowed in normalized for allowed in ALLOWED_FOCUS_PACKAGES)
 
 
+def _is_home_package(pkg: str) -> bool:
+    normalized = pkg.lower()
+    return any(normalized.startswith(home.lower()) for home in HOME_LAUNCHER_PACKAGES)
+
+
 def _dump_ui_xml(adb_client: ADBClient) -> str:
     dump_path = f"/sdcard/qa_live_dump_{int(time.time() * 1000)}.xml"
     try:
@@ -367,17 +402,21 @@ def _is_live_channel_screen(xml_data: str) -> bool:
         root = ET.fromstring(xml_data)
     except ET.ParseError:
         return False
+    package_match = False
     guidance_match = False
     edit_text_present = False
     for node in root.iter("node"):
         resource_id = node.attrib.get("resource-id", "")
-        text_value = node.attrib.get("text", "")
+        text_value = (node.attrib.get("text") or "").strip()
         class_name = node.attrib.get("class", "")
-        if resource_id == GUIDANCE_TITLE_ID and HEBREW_PROMPT_TOKEN in text_value:
+        pkg_attr = node.attrib.get("package", "")
+        if pkg_attr == SETTINGS_PACKAGE:
+            package_match = True
+        if resource_id == GUIDANCE_TITLE_ID and text_value == GUIDANCE_PROMPT_TEXT:
             guidance_match = True
         if resource_id == GUIDED_ACTION_EDIT_ID and "EditText" in class_name:
             edit_text_present = True
-    return guidance_match or edit_text_present
+    return package_match and guidance_match and edit_text_present
 
 
 def _extract_edit_text_value(xml_data: str) -> Optional[str]:

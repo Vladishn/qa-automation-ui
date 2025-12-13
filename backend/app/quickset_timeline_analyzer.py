@@ -245,6 +245,16 @@ ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "evidence_keys": ["live_button_signals"],
     },
+    "live_mapping_screen_not_reached": {
+        "category": "functional",
+        "severity": "high",
+        "title": "Live channel settings screen not reached",
+        "default_description": "Automation could not reach the Live channel settings UI.",
+        "recommendations": [
+            "Re-run the scenario and ensure the device exits third-party apps before opening Settings.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    },
 }
 
 for idx, phase_label in enumerate(("Initial Live press", "After force-stop", "After reboot"), start=1):
@@ -1887,6 +1897,7 @@ def _build_live_button_session_summary(
     config_attempted = bool(getattr(live_signals, "config_attempted", False))
     config_verified = bool(getattr(live_signals, "config_verified", False))
     session_logs_found = bool(getattr(live_signals, "session_logs_found", True))
+    config_screen_detected = bool(getattr(live_signals, "config_screen_detected", False))
     phase_data_present = bool(live_signals and live_signals.phases)
     no_live_signals = (
         live_signals is None
@@ -1927,6 +1938,7 @@ def _build_live_button_session_summary(
                 ],
                 "raw_excerpt": raw_excerpt_snippet,
                 "no_markers_found": no_markers_found,
+                "config_screen_detected": config_screen_detected,
             },
         }
 
@@ -1982,6 +1994,93 @@ def _build_live_button_session_summary(
             evidence=evidence_block,
             recommendations=recommendations,
             confidence="low",
+        )
+
+        return summary, analyzer_result
+
+    if not config_screen_detected and session_logs_found:
+        analysis_text = "Live button mapping failed: the Live channel settings screen was never reached."
+        log_verdict = "FAIL"
+        confidence = "high"
+        _add_live_root_cause("live_mapping_screen_not_reached", analysis_text)
+        if config_row:
+            config_row.status = StepStatus.FAIL
+        for row in phase_rows.values():
+            if row:
+                row.status = StepStatus.INFO
+
+        evidence_block = {
+            "live_button_signals": {
+                "expected_channel": expected_channel,
+                "config_saved_channel": live_signals.config_saved_channel,
+                "config_attempted": config_attempted,
+                "config_verified": config_verified,
+                "config_screen_detected": config_screen_detected,
+                "session_logs_found": session_logs_found,
+                "phases": [
+                    {
+                        "phase": phase.phase,
+                        "live_key_pressed": phase.live_key_pressed,
+                        "partnertv_launched": phase.partnertv_launched,
+                        "observed_channel": phase.observed_channel,
+                        "raw_excerpt": phase.raw_excerpt,
+                    }
+                    for phase in live_signals.phases
+                ],
+                "raw_excerpt": raw_excerpt_snippet,
+                "no_markers_found": no_markers_found,
+            },
+        }
+        awaiting_steps, failed_steps = _collect_step_statuses()
+        if summary_row:
+            details = dict(summary_row.details or {})
+            details.update(
+                {
+                    "analysis": analysis_text,
+                    "tester_verdict": "AUTOMATED",
+                    "log_verdict": log_verdict,
+                    "evidence": evidence_block,
+                    "recommendations": recommendations,
+                    "failure_insights": [ins.model_dump(mode="json") for ins in root_causes],
+                }
+            )
+            summary_row.details = details
+            summary_row.status = StepStatus.FAIL
+        test_completed_row = _find_row(timeline_rows, "test_completed")
+        if test_completed_row:
+            test_completed_row.status = StepStatus.FAIL
+            if finished_at:
+                test_completed_row.timestamp = finished_at
+
+        summary = SessionSummary(
+            session_id=session_id,
+            scenario_name=scenario_name,
+            started_at=started_at,
+            finished_at=finished_at,
+            overall_status=StepStatus.FAIL,
+            brand_mismatch=False,
+            tv_brand_user=None,
+            tv_brand_log=None,
+            has_volume_issue=False,
+            has_osd_issue=False,
+            notes=None,
+            analysis_text=analysis_text,
+            has_failure=True,
+            brand_status="NOT_EVALUATED",
+            volume_status="NOT_EVALUATED",
+            osd_status="NOT_EVALUATED",
+        )
+
+        analyzer_result = AnalyzerResult(
+            overall_status=StepStatus.FAIL.value,
+            has_failure=True,
+            failed_steps=failed_steps,
+            awaiting_steps=awaiting_steps,
+            analysis_text=analysis_text,
+            failure_insights=root_causes,
+            evidence=evidence_block,
+            recommendations=recommendations,
+            confidence=confidence,
         )
 
         return summary, analyzer_result
@@ -2101,6 +2200,7 @@ def _build_live_button_session_summary(
             "config_saved_channel": live_signals.config_saved_channel,
             "config_attempted": config_attempted,
             "config_verified": config_confirmed,
+            "config_screen_detected": config_screen_detected,
             "session_logs_found": session_logs_found,
             "phases": [
                 {

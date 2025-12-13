@@ -5,6 +5,7 @@ def test_parse_live_button_logs_detects_all_phases() -> None:
     log_text = """
     12-08 11:00:00.100 I/QA_LIVE: SESSION=QS_TEST CONFIG_START channel=50
     12-08 11:00:01.000 I/quickset: Saved StingTV channel: 50
+    12-08 11:00:02.200 I/QA_LIVE: SESSION=QS_TEST LIVE_CHANNEL_SCREEN_OK
     12-08 11:00:05.500 I/QA_LIVE: SESSION=QS_TEST PHASE1_START expected=50
     12-08 11:00:05.600 I/GlobalKeyInterceptor: onReceive keyCode = 172
     12-08 11:00:06.000 I/ActivityTaskManager: START u0 cmp=il.co.partnertv.atv/.HomeActivity pkg=il.co.partnertv.atv
@@ -24,6 +25,7 @@ def test_parse_live_button_logs_detects_all_phases() -> None:
 
     assert signals.config_saved_channel == 50
     assert signals.config_attempted is True
+    assert signals.config_screen_detected is True
     assert signals.config_verified is True
     phases = {phase.phase: phase for phase in signals.phases}
     assert phases["PHASE1"].observed_channel == 50
