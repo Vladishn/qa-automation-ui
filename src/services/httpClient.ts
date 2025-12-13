@@ -27,6 +27,7 @@ function buildUrl(
  */
 type RequestOptions = {
   headers?: Record<string, string>;
+  signal?: AbortSignal;
 };
 
 function mergeHeaders(base: Record<string, string>, extra?: Record<string, string>): Record<string, string> {
@@ -51,6 +52,7 @@ export async function apiGet<T>(
       },
       options?.headers
     ),
+    signal: options?.signal,
   });
 
   if (!res.ok) {

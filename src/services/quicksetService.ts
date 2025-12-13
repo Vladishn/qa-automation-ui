@@ -2,11 +2,14 @@ import { apiGet, apiPost } from './httpClient';
 import type { QuickSetSession } from '../types/domain';
 import type { TvAutoSyncSessionResponse } from '../types/quickset';
 
+export type QuicksetScenarioId = 'TV_AUTO_SYNC' | 'LIVE_BUTTON_MAPPING';
+
 export interface RunScenarioParams {
   testerId: string;
   stbIp: string;
   apiKey: string;
-  scenarioName: 'TV_AUTO_SYNC';
+  scenarioName: QuicksetScenarioId;
+  expectedChannel?: number;
 }
 
 export interface RunScenarioResponse {
@@ -15,14 +18,18 @@ export interface RunScenarioResponse {
 }
 
 export async function runScenario(params: RunScenarioParams): Promise<RunScenarioResponse> {
-  const { testerId, stbIp, apiKey, scenarioName } = params;
+  const { testerId, stbIp, apiKey, scenarioName, expectedChannel } = params;
+  const body: Record<string, unknown> = {
+    tester_id: testerId,
+    stb_ip: stbIp,
+    scenario_name: scenarioName
+  };
+  if (typeof expectedChannel === 'number') {
+    body.expected_channel = expectedChannel;
+  }
   return apiPost<RunScenarioResponse>(
     '/api/quickset/scenarios/run',
-    {
-      tester_id: testerId,
-      stb_ip: stbIp,
-      scenario_name: scenarioName,
-    },
+    body,
     {
       headers: {
         'X-QuickSet-Api-Key': apiKey,
@@ -31,11 +38,16 @@ export async function runScenario(params: RunScenarioParams): Promise<RunScenari
   );
 }
 
-export async function getSession(sessionId: string, apiKey: string): Promise<TvAutoSyncSessionResponse> {
+export async function getSession(
+  sessionId: string,
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<TvAutoSyncSessionResponse> {
   return apiGet<TvAutoSyncSessionResponse>(`/api/quickset/sessions/${sessionId}`, undefined, {
     headers: {
       'X-QuickSet-Api-Key': apiKey,
     },
+    signal,
   });
 }
 

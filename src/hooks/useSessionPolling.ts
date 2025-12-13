@@ -15,11 +15,20 @@ export function useSessionPolling(sessionId: string | null, apiKey: string | nul
   const [error, setError] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
   const completedRef = useRef(false);
+  const generationRef = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
 
   const clearTimer = () => {
     if (timerRef.current !== null) {
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
+    }
+  };
+
+  const abortInFlight = () => {
+    if (activeControllerRef.current) {
+      activeControllerRef.current.abort();
+      activeControllerRef.current = null;
     }
   };
 
@@ -32,7 +41,10 @@ export function useSessionPolling(sessionId: string | null, apiKey: string | nul
   };
 
   useEffect(() => {
+    generationRef.current += 1;
+    const currentGeneration = generationRef.current;
     let cancelled = false;
+    abortInFlight();
     clearTimer();
     completedRef.current = false;
 
@@ -46,9 +58,11 @@ export function useSessionPolling(sessionId: string | null, apiKey: string | nul
     }
 
     const poll = async () => {
+      const controller = new AbortController();
+      activeControllerRef.current = controller;
       try {
-        const response = await getSession(sessionId, apiKey);
-        if (cancelled) {
+        const response = await getSession(sessionId, apiKey, controller.signal);
+        if (cancelled || currentGeneration !== generationRef.current) {
           return;
         }
         setData(response);
@@ -59,13 +73,13 @@ export function useSessionPolling(sessionId: string | null, apiKey: string | nul
           return;
         }
       } catch (err) {
-        if (cancelled) {
+        if (cancelled || controller.signal.aborted || currentGeneration !== generationRef.current) {
           return;
         }
         const message = err instanceof Error ? err.message : 'Failed to fetch session';
         setError(message);
       } finally {
-        if (!cancelled && !completedRef.current) {
+        if (!cancelled && !completedRef.current && currentGeneration === generationRef.current) {
           clearTimer();
           timerRef.current = window.setTimeout(poll, POLL_INTERVAL_MS);
         }
@@ -76,6 +90,7 @@ export function useSessionPolling(sessionId: string | null, apiKey: string | nul
 
     return () => {
       cancelled = true;
+      abortInFlight();
       clearTimer();
       completedRef.current = false;
     };

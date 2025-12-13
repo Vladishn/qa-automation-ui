@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .analyzers.base import AnalyzerResult, FailureInsight
 from .quickset_log_parser import QuicksetLogSignals, parse_quickset_logs
+from .live_button_log_parser import LiveButtonSignals, parse_live_button_logs
 
 # QuickSet log parsing relies on QuicksetLogSignals/parse_quickset_logs as the
 # single source of truth for TV_AUTO_SYNC log evidence.
@@ -21,6 +22,7 @@ class StepStatus(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
     AWAITING_INPUT = "AWAITING_INPUT"
+    INCONCLUSIVE = "INCONCLUSIVE"
 
 
 MetricStatus = Literal["OK", "FAIL", "INCOMPATIBILITY", "NOT_EVALUATED"]
@@ -33,6 +35,14 @@ WHITELISTED_STEPS = {
     "question_pairing_screen_seen",
     "question_tv_brand_ui",
     "question_notes",
+    "question_expected_channel",
+    "live_expected_channel",
+    "test_started",
+    "configure_live_mapping",
+    "phase1_live_press",
+    "phase2_kill_and_relaunch",
+    "phase3_reboot_persist",
+    "test_completed",
     "analysis_summary",
 }
 
@@ -183,7 +193,92 @@ ROOT_CAUSE_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "evidence_keys": ["tv_config_events", "volume_source_history"],
     },
+    "live_button_wrong_channel": {
+        "category": "functional",
+        "severity": "high",
+        "title": "Live button mapped to wrong channel",
+        "default_description": "Logs show the Live button opened PartnerTV+ on an unexpected channel.",
+        "recommendations": [
+            "Reconfigure the Live button mapping to the desired channel.",
+            "Verify the Live button customization settings in PartnerTV+.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    },
+    "live_button_logs_inconclusive": {
+        "category": "tooling",
+        "severity": "low",
+        "title": "Logs inconclusive for Live button",
+        "default_description": "Logs did not contain enough Live-button signals; relying on tester verdict.",
+        "recommendations": [
+            "Retry the Live button test and ensure logging captures the key press and app launch.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    },
+    "live_button_tester_failure": {
+        "category": "functional",
+        "severity": "medium",
+        "title": "Tester reported Live button failure",
+        "default_description": "Tester reported that the Live button did not open PartnerTV+ on the expected channel.",
+        "recommendations": [
+            "Re-run the Live button mapping flow and verify the configured channel.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    },
+    "live_button_logs_inconclusive_all_phases": {
+        "category": "tooling",
+        "severity": "low",
+        "title": "Live button logs inconclusive",
+        "default_description": "Live button logs did not include configuration or press signals.",
+        "recommendations": [
+            "Verify logcat capture for the session and rerun the Live button automation.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    },
+    "live_mapping_not_configured": {
+        "category": "functional",
+        "severity": "high",
+        "title": "Live button mapping not configured",
+        "default_description": "Logs did not confirm that the Live button mapping was saved.",
+        "recommendations": [
+            "Reconfigure the Live button mapping in Settings and re-run the test.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    },
 }
+
+for idx, phase_label in enumerate(("Initial Live press", "After force-stop", "After reboot"), start=1):
+    ROOT_CAUSE_METADATA[f"live_button_wrong_channel_phase{idx}"] = {
+        "category": "functional",
+        "severity": "high",
+        "title": f"Live button wrong channel – phase {idx}",
+        "default_description": f"{phase_label}: PartnerTV+ opened on the wrong channel.",
+        "recommendations": [
+            "Reconfigure the Live button mapping to the desired channel.",
+            "Verify PartnerTV+ GUIDE intent parameters.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    }
+    ROOT_CAUSE_METADATA[f"live_button_no_launch_phase{idx}"] = {
+        "category": "functional",
+        "severity": "high",
+        "title": f"Live button failed to launch – phase {idx}",
+        "default_description": f"{phase_label}: Live key press did not launch PartnerTV+.",
+        "recommendations": [
+            "Check that PartnerTV+ is installed and automation can launch it.",
+            "Confirm the Live key navigation path is correct.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    }
+    ROOT_CAUSE_METADATA[f"live_button_logs_inconclusive_phase{idx}"] = {
+        "category": "tooling",
+        "severity": "low",
+        "title": f"Live button logs inconclusive – phase {idx}",
+        "default_description": f"{phase_label}: Logs did not capture enough evidence.",
+        "recommendations": [
+            "Re-run the scenario with log capture enabled and verify QA_LIVE markers.",
+        ],
+        "evidence_keys": ["live_button_signals"],
+    }
 
 TV_AUTO_SYNC_MARKERS = {
     "question_tv_volume_changed",
@@ -205,9 +300,15 @@ STATE_SNAPSHOT_STEP_NAME = "state_snapshot"
 STATE_LABEL_BEFORE = "before_autosync"
 STATE_LABEL_AFTER = "after_autosync"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LIVE_LOG_DIR = PROJECT_ROOT / "artifacts" / "live_logs"
 LOG_DIR_CANDIDATES = [
     PROJECT_ROOT / "artifacts" / "quickset_logs",
     PROJECT_ROOT / "artifacts" / "logs",
+]
+LIVE_LOG_SNIPPET_PATTERNS = [
+    re.compile(r"QA_LIVE", re.IGNORECASE),
+    re.compile(r"PartnerTV\+\s+GUIDE intent sent", re.IGNORECASE),
+    re.compile(r"GlobalKeyInterceptor", re.IGNORECASE),
 ]
 PROBE_EVENT_NAMES = {
     "volume_probe_result",
@@ -322,13 +423,21 @@ class AutosyncLogVerdictInfo:
     logs_inconclusive: bool
 
 
-def load_logcat_text(session_id: str) -> str:
+def load_logcat_text(session_id: str, scenario_name: Optional[str] = None) -> str:
+    scenario_slug = (scenario_name or "").strip().lower()
+    suffixes: List[str] = []
+    if scenario_slug:
+        suffixes.append(scenario_slug)
+    suffixes.extend(["tv_auto_sync", "live_button_mapping", ""])
     candidates: List[Path] = []
     for base in LOG_DIR_CANDIDATES:
-        candidates.append(base / session_id / f"{session_id}_tv_auto_sync.log")
-        candidates.append(base / f"{session_id}_tv_auto_sync.log")
-        candidates.append(base / session_id / f"{session_id}.log")
-        candidates.append(base / f"{session_id}.log")
+        for suffix in suffixes:
+            if suffix:
+                candidates.append(base / session_id / f"{session_id}_{suffix}.log")
+                candidates.append(base / f"{session_id}_{suffix}.log")
+            else:
+                candidates.append(base / session_id / f"{session_id}.log")
+                candidates.append(base / f"{session_id}.log")
     for candidate in candidates:
         if candidate.exists():
             return candidate.read_text(encoding="utf-8", errors="ignore")
@@ -344,6 +453,28 @@ def load_logcat_text(session_id: str) -> str:
             if matches:
                 return matches[0].read_text(encoding="utf-8", errors="ignore")
     return ""
+
+
+def load_live_button_log_text(session_id: str) -> str:
+    log_path = LIVE_LOG_DIR / f"live_{session_id}.log"
+    if log_path.exists():
+        return log_path.read_text(encoding="utf-8", errors="ignore")
+    return ""
+
+
+def _extract_live_log_excerpt(log_text: Optional[str]) -> Tuple[str, bool]:
+    if not log_text:
+        return "[no live log captured]", True
+    for pattern in LIVE_LOG_SNIPPET_PATTERNS:
+        match = pattern.search(log_text)
+        if match:
+            start = max(0, match.start() - 200)
+            end = min(len(log_text), match.end() + 400)
+            return log_text[start:end].strip(), False
+    snippet = log_text[:800].strip()
+    if not snippet:
+        snippet = "[live log captured but empty excerpt]"
+    return snippet, True
 
 
 def _detect_volume_source(log_text: str) -> Optional[str]:
@@ -514,17 +645,27 @@ def build_timeline_and_summary(
     before_snap = snapshots.get(STATE_LABEL_BEFORE)
     after_snap = snapshots.get(STATE_LABEL_AFTER)
 
-    user_answers = _extract_user_answers(raw_events)
-    volume_probe = _extract_volume_probe(raw_events, user_answers)
-    log_brand = _derive_log_brand(before_snap, after_snap, raw_events)
-    log_text = load_logcat_text(session_id)
-    log_evidence = analyze_log_evidence(log_text, log_brand)
-    log_signals = parse_quickset_logs(log_text)
-    _merge_quickset_signals(log_evidence, log_signals)
-
     resolved_scenario_name = scenario_name or "UNKNOWN"
     if not resolved_scenario_name or resolved_scenario_name.upper() == "UNKNOWN":
         resolved_scenario_name = _infer_scenario_name(raw_events)
+    upper_scenario = resolved_scenario_name.upper()
+
+    user_answers = _extract_user_answers(raw_events)
+    volume_probe = _extract_volume_probe(raw_events, user_answers)
+    log_brand = _derive_log_brand(before_snap, after_snap, raw_events)
+    live_log_text = load_live_button_log_text(session_id) if upper_scenario == "LIVE_BUTTON_MAPPING" else ""
+    log_text = live_log_text or load_logcat_text(session_id, resolved_scenario_name)
+    log_evidence = analyze_log_evidence(log_text, log_brand)
+    live_log_excerpt = live_log_text or log_text
+    expected_channel_value = _resolve_expected_channel(user_answers, raw_events)
+    log_signals: Optional[QuicksetLogSignals] = None
+    if upper_scenario == "TV_AUTO_SYNC":
+        log_signals = parse_quickset_logs(log_text)
+        _merge_quickset_signals(log_evidence, log_signals)
+        autosync_started_flag = bool(getattr(log_signals, "autosync_started", False))
+        autosync_success_flag = bool(getattr(log_signals, "autosync_completed_successfully", False))
+        log_evidence.autosync_started = log_evidence.autosync_started or autosync_started_flag
+        log_evidence.autosync_success = log_evidence.autosync_success or autosync_success_flag
 
     timeline_rows, missing_critical = _build_timeline_rows(
         raw_events=raw_events,
@@ -536,15 +677,28 @@ def build_timeline_and_summary(
         log_evidence=log_evidence,
     )
 
-    summary, analyzer_result = _build_session_summary(
-        session_id=session_id,
-        scenario_name=resolved_scenario_name,
-        raw_events=raw_events,
-        timeline_rows=timeline_rows,
-        log_brand=log_evidence.log_brand,
-        missing_critical=missing_critical,
-        log_evidence=log_evidence,
-    )
+    if upper_scenario == "LIVE_BUTTON_MAPPING":
+        live_signals = parse_live_button_logs(log_text, expected_channel_value)
+        summary, analyzer_result = _build_live_button_session_summary(
+            session_id=session_id,
+            scenario_name=resolved_scenario_name,
+            raw_events=raw_events,
+            timeline_rows=timeline_rows,
+            user_answers=user_answers,
+            live_signals=live_signals,
+            expected_channel=expected_channel_value,
+            log_excerpt=live_log_excerpt,
+        )
+    else:
+        summary, analyzer_result = _build_session_summary(
+            session_id=session_id,
+            scenario_name=resolved_scenario_name,
+            raw_events=raw_events,
+            timeline_rows=timeline_rows,
+            log_brand=log_evidence.log_brand,
+            missing_critical=missing_critical,
+            log_evidence=log_evidence,
+        )
 
     summary_dict = summary.to_dict()
     analysis_result_payload = analyzer_result.model_dump(mode="json")
@@ -620,6 +774,14 @@ def _infer_scenario_name(events: List[Dict[str, Any]]) -> str:
         base_name = _normalize_base_step_name(step_name)
         if base_name in TV_AUTO_SYNC_MARKERS or "tv_auto_sync" in step_name.lower():
             return "TV_AUTO_SYNC"
+        if base_name in {
+            "question_expected_channel",
+            "configure_live_mapping",
+            "phase1_live_press",
+            "phase2_kill_and_relaunch",
+            "phase3_reboot_persist",
+        }:
+            return "LIVE_BUTTON_MAPPING"
 
     return "UNKNOWN"
 
@@ -816,6 +978,35 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(str(value).strip())
+        return parsed if parsed > 0 else default
+    except (ValueError, TypeError, AttributeError):
+        return default
+
+
+def _resolve_expected_channel(
+    user_answers: Dict[str, str],
+    raw_events: List[Dict[str, Any]],
+    default: int = 3,
+) -> int:
+    if "question_expected_channel" in user_answers:
+        return _safe_int(user_answers["question_expected_channel"], default)
+    for ev in raw_events:
+        base_name = _normalize_base_step_name(str(ev.get("step_name") or ""))
+        if base_name not in {"live_expected_channel", "question_expected_channel"}:
+            continue
+        details = ev.get("details") or {}
+        candidate = details.get("expected_channel") or details.get("answer") or details.get("value")
+        if candidate is None:
+            continue
+        return _safe_int(candidate, default)
+    return default
+
+
 def _event_has_volume_signal(details: Dict[str, Any]) -> bool:
     for key in VOLUME_SIGNAL_KEYS:
         if key not in details:
@@ -958,6 +1149,9 @@ def _build_timeline_rows(
                 row.question = question
 
         row.details.update(details)
+        event_status = _event_status_to_step_status(ev.get("status"))
+        if event_status:
+            row.status = event_status
 
     for name, row in rows_by_name.items():
         if name == "question_manual_trigger":
@@ -972,6 +1166,8 @@ def _build_timeline_rows(
             _apply_brand(row, log_brand)
         elif name == "question_notes":
             _apply_notes(row)
+        elif name == "live_expected_channel":
+            _apply_expected_channel_metadata(row)
 
     _apply_volume_probe_to_rows(rows_by_name, volume_probe)
 
@@ -984,6 +1180,21 @@ def _build_timeline_rows(
     return rows, missing_critical
 
 
+def _event_status_to_step_status(raw_value: Any) -> Optional[StepStatus]:
+    if not raw_value:
+        return None
+    normalized = str(raw_value).strip().upper()
+    if normalized in StepStatus.__members__:
+        return StepStatus[normalized]
+    if normalized in ("RUNNING", "START"):
+        return StepStatus.INFO
+    return None
+
+
+def _find_row(rows: List[StepRow], name: str) -> Optional[StepRow]:
+    return next((row for row in rows if row.name == name), None)
+
+
 def _friendly_label(name: str) -> str:
     mapping = {
         "question_manual_trigger": "Manual trigger",
@@ -992,6 +1203,14 @@ def _friendly_label(name: str) -> str:
         "question_pairing_screen_seen": "Pairing screen",
         "question_tv_brand_ui": "TV brand (UI vs log)",
         "question_notes": "Tester notes",
+        "question_expected_channel": "Expected channel",
+        "live_expected_channel": "Expected channel",
+        "test_started": "Test started",
+        "configure_live_mapping": "Configure Live button mapping",
+        "phase1_live_press": "Phase 1: Live press",
+        "phase2_kill_and_relaunch": "Phase 2: Kill + press",
+        "phase3_reboot_persist": "Phase 3: Reboot + press",
+        "test_completed": "Test completed",
         "analysis_summary": "Scenario summary",
     }
     return mapping.get(name, name)
@@ -1101,6 +1320,15 @@ def _apply_brand(
 
 def _apply_notes(row: StepRow) -> None:
     row.status = StepStatus.INFO
+
+
+def _apply_expected_channel_metadata(row: StepRow) -> None:
+    expected_value = row.details.get("expected_channel") or row.details.get("answer")
+    if expected_value is None:
+        row.status = StepStatus.INFO
+        return
+    row.user_answer = str(expected_value)
+    row.status = StepStatus.PASS
 
 
 def _answer_flags(row: Optional[StepRow]) -> tuple[bool, bool]:
@@ -1600,6 +1828,327 @@ def _build_analysis_details(
         confidence = "high"
 
     return root_causes, evidence_block, recs, confidence
+
+
+def _build_live_button_session_summary(
+    *,
+    session_id: str,
+    scenario_name: str,
+    raw_events: List[Dict[str, Any]],
+    timeline_rows: List[StepRow],
+    user_answers: Dict[str, str],
+    live_signals: LiveButtonSignals,
+    expected_channel: int,
+    log_excerpt: Optional[str] = None,
+) -> Tuple[SessionSummary, AnalyzerResult]:
+    started_at, finished_at = _extract_session_times(raw_events)
+    summary_row = _find_row(timeline_rows, "analysis_summary")
+    expected_row = _find_row(timeline_rows, "question_expected_channel") or _find_row(
+        timeline_rows, "live_expected_channel"
+    )
+    config_row = _find_row(timeline_rows, "configure_live_mapping")
+    phase_rows = {
+        "PHASE1": _find_row(timeline_rows, "phase1_live_press"),
+        "PHASE2": _find_row(timeline_rows, "phase2_kill_and_relaunch"),
+        "PHASE3": _find_row(timeline_rows, "phase3_reboot_persist"),
+    }
+
+    expected_channel_text = user_answers.get("question_expected_channel")
+    if expected_row:
+        expected_value = expected_channel_text or expected_row.details.get("expected_channel")
+        expected_row.user_answer = str(expected_value or expected_channel)
+        expected_row.status = StepStatus.PASS
+
+    raw_excerpt_snippet, no_markers_found = _extract_live_log_excerpt(log_excerpt)
+
+    def _collect_step_statuses() -> Tuple[List[str], List[str]]:
+        awaiting = sorted(row.name for row in timeline_rows if row.status == StepStatus.AWAITING_INPUT)
+        failed = sorted(row.name for row in timeline_rows if row.status == StepStatus.FAIL)
+        return awaiting, failed
+
+    root_causes: List[FailureInsight] = []
+    recommendations: List[str] = []
+
+    def _add_live_root_cause(code: str, description: str) -> None:
+        _add_root_cause(root_causes, recommendations, code, description)
+
+    config_attempted = bool(getattr(live_signals, "config_attempted", False))
+    phase_data_present = bool(live_signals and live_signals.phases)
+    no_live_signals = (
+        live_signals is None
+        or (
+            live_signals.config_saved_channel is None
+            and not phase_data_present
+            and not config_attempted
+        )
+    )
+
+    if no_live_signals:
+        analysis_text = "INCONCLUSIVE – no log evidence captured."
+        log_verdict = "INCONCLUSIVE"
+        _add_live_root_cause(
+            "live_button_logs_inconclusive_all_phases",
+            "No Live-button configuration or press signals were found in the analyzed logs.",
+        )
+
+        for row in [config_row, phase_rows.get("PHASE1"), phase_rows.get("PHASE2"), phase_rows.get("PHASE3")]:
+            if row:
+                row.status = StepStatus.INCONCLUSIVE
+
+        evidence_block = {
+            "live_button_signals": {
+                "expected_channel": expected_channel,
+                "config_saved_channel": live_signals.config_saved_channel if live_signals else None,
+                 "config_attempted": config_attempted,
+                "phases": [
+                    {
+                        "phase": phase.phase,
+                        "live_key_pressed": phase.live_key_pressed,
+                        "partnertv_launched": phase.partnertv_launched,
+                        "observed_channel": phase.observed_channel,
+                    }
+                    for phase in (live_signals.phases if live_signals else [])
+                ],
+                "raw_excerpt": raw_excerpt_snippet,
+                "no_markers_found": no_markers_found,
+            },
+        }
+
+        awaiting_steps, failed_steps = _collect_step_statuses()
+
+        if summary_row:
+            details = dict(summary_row.details or {})
+            details.update(
+                {
+                    "analysis": analysis_text,
+                    "tester_verdict": "AUTOMATED",
+                    "log_verdict": log_verdict,
+                    "evidence": evidence_block,
+                    "recommendations": recommendations,
+                    "failure_insights": [ins.model_dump(mode="json") for ins in root_causes],
+                }
+            )
+            summary_row.details = details
+            summary_row.status = StepStatus.INCONCLUSIVE
+
+        test_completed_row = _find_row(timeline_rows, "test_completed")
+        if test_completed_row:
+            test_completed_row.status = StepStatus.INCONCLUSIVE
+
+        summary = SessionSummary(
+            session_id=session_id,
+            scenario_name=scenario_name,
+            started_at=started_at,
+            finished_at=finished_at,
+            overall_status=StepStatus.INCONCLUSIVE,
+            brand_mismatch=False,
+            tv_brand_user=None,
+            tv_brand_log=None,
+            has_volume_issue=False,
+            has_osd_issue=False,
+            notes=None,
+            analysis_text=analysis_text,
+            has_failure=False,
+            brand_status="NOT_EVALUATED",
+            volume_status="NOT_EVALUATED",
+            osd_status="NOT_EVALUATED",
+        )
+
+        analyzer_result = AnalyzerResult(
+            overall_status=StepStatus.INCONCLUSIVE.value,
+            has_failure=False,
+            failed_steps=failed_steps,
+            awaiting_steps=awaiting_steps,
+            analysis_text=analysis_text,
+            failure_insights=root_causes,
+            evidence=evidence_block,
+            recommendations=recommendations,
+            confidence="low",
+        )
+
+        return summary, analyzer_result
+
+    phases_by_name = {(phase.phase or "").upper(): phase for phase in live_signals.phases}
+
+    config_confirmed = (
+        live_signals.config_saved_channel is not None
+        and expected_channel is not None
+        and live_signals.config_saved_channel == expected_channel
+    )
+    if not config_confirmed and config_row:
+        config_row.status = StepStatus.FAIL
+
+    phase_descriptions = {
+        "PHASE1": "initial Live press",
+        "PHASE2": "Live press after force-stop",
+        "PHASE3": "Live press after reboot",
+    }
+    phase_fail_messages: List[str] = []
+    phase_inconclusive: List[str] = []
+
+    for index, phase_name in enumerate(("PHASE1", "PHASE2", "PHASE3"), start=1):
+        signals = phases_by_name.get(phase_name)
+        row = phase_rows.get(phase_name)
+        desc = phase_descriptions[phase_name]
+        if row and row.details.get("skipped_due_to_config_error"):
+            continue
+        observed_channel = signals.observed_channel if signals else None
+        phase_pass = (
+            signals is not None
+            and signals.live_key_pressed
+            and signals.partnertv_launched
+            and observed_channel is not None
+            and observed_channel == expected_channel
+        )
+        if phase_pass:
+            if row:
+                row.status = StepStatus.PASS
+            continue
+
+        if signals is None or (
+            not signals.live_key_pressed and not signals.partnertv_launched and signals.observed_channel is None
+        ):
+            reason = f"{desc}: logs were inconclusive."
+            phase_inconclusive.append(reason)
+            _add_live_root_cause(f"live_button_logs_inconclusive_phase{index}", reason)
+            if row:
+                row.status = StepStatus.INCONCLUSIVE
+            continue
+
+        if observed_channel is not None and observed_channel != expected_channel:
+            reason = (
+                f"{desc}: PartnerTV+ opened on channel {observed_channel}, expected {expected_channel}."
+            )
+            phase_fail_messages.append(reason)
+            _add_live_root_cause(f"live_button_wrong_channel_phase{index}", reason)
+            if row:
+                row.status = StepStatus.FAIL
+            continue
+
+        if signals.live_key_pressed and not signals.partnertv_launched:
+            reason = f"{desc}: Live key press detected but PartnerTV+ did not launch."
+            phase_fail_messages.append(reason)
+            _add_live_root_cause(f"live_button_no_launch_phase{index}", reason)
+            if row:
+                row.status = StepStatus.FAIL
+            continue
+
+        reason = f"{desc}: logs missing channel confirmation."
+        phase_inconclusive.append(reason)
+        _add_live_root_cause(f"live_button_logs_inconclusive_phase{index}", reason)
+        if row:
+            row.status = StepStatus.INCONCLUSIVE
+
+    if not config_confirmed:
+        overall = StepStatus.FAIL
+        if config_attempted:
+            analysis_text = (
+                f"Live button mapping failed: configuration attempt detected but logs never confirmed Saved channel "
+                f"{expected_channel}."
+            )
+            log_verdict = "INCONCLUSIVE"
+            confidence = "low"
+        else:
+            analysis_text = (
+                f"Live button mapping failed: logs did not confirm Saved StingTV channel {expected_channel}."
+            )
+            log_verdict = "FAIL"
+            confidence = "high"
+        _add_live_root_cause("live_mapping_not_configured", analysis_text)
+    elif phase_fail_messages:
+        overall = StepStatus.FAIL
+        analysis_text = "; ".join(phase_fail_messages)
+        log_verdict = "FAIL"
+        confidence = "high"
+    elif phase_inconclusive:
+        overall = StepStatus.FAIL
+        analysis_text = "; ".join(phase_inconclusive)
+        log_verdict = "INCONCLUSIVE"
+        confidence = "low"
+    else:
+        overall = StepStatus.PASS
+        analysis_text = (
+            f"Live button mapping passed: PartnerTV+ opened on channel {expected_channel} across all phases "
+            "(initial, after kill, after reboot)."
+        )
+        log_verdict = "PASS"
+        confidence = "high"
+
+    has_failure = overall == StepStatus.FAIL
+
+    evidence_block = {
+        "live_button_signals": {
+            "expected_channel": expected_channel,
+            "config_saved_channel": live_signals.config_saved_channel,
+            "config_attempted": config_attempted,
+            "phases": [
+                {
+                    "phase": phase.phase,
+                    "live_key_pressed": phase.live_key_pressed,
+                    "partnertv_launched": phase.partnertv_launched,
+                    "observed_channel": phase.observed_channel,
+                    "raw_excerpt": phase.raw_excerpt,
+                }
+                for phase in live_signals.phases
+            ],
+            "raw_excerpt": raw_excerpt_snippet,
+            "no_markers_found": no_markers_found,
+        },
+    }
+
+    awaiting_steps, failed_steps = _collect_step_statuses()
+
+    if summary_row:
+        details = dict(summary_row.details or {})
+        details.update(
+            {
+                "analysis": analysis_text,
+                "tester_verdict": "AUTOMATED",
+                "log_verdict": log_verdict,
+                "evidence": evidence_block,
+                "recommendations": recommendations,
+                "failure_insights": [ins.model_dump(mode="json") for ins in root_causes],
+            }
+        )
+        summary_row.details = details
+        summary_row.status = overall
+
+    test_completed_row = _find_row(timeline_rows, "test_completed")
+    if test_completed_row:
+        test_completed_row.status = overall
+
+    summary = SessionSummary(
+        session_id=session_id,
+        scenario_name=scenario_name,
+        started_at=started_at,
+        finished_at=finished_at,
+        overall_status=overall,
+        brand_mismatch=False,
+        tv_brand_user=None,
+        tv_brand_log=None,
+        has_volume_issue=False,
+        has_osd_issue=False,
+        notes=None,
+        analysis_text=analysis_text,
+        has_failure=has_failure,
+        brand_status="NOT_EVALUATED",
+        volume_status="NOT_EVALUATED",
+        osd_status="NOT_EVALUATED",
+    )
+
+    analyzer_result = AnalyzerResult(
+        overall_status=overall.value,
+        has_failure=has_failure,
+        failed_steps=failed_steps,
+        awaiting_steps=awaiting_steps,
+        analysis_text=analysis_text,
+        failure_insights=root_causes,
+        evidence=evidence_block,
+        recommendations=recommendations,
+        confidence=confidence,
+    )
+
+    return summary, analyzer_result
 
 
 def _build_session_summary(

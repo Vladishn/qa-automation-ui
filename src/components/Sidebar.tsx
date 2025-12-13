@@ -91,7 +91,7 @@ const Sidebar: React.FC<SidebarProps> = ({ currentPage, onChangePage }) => {
                 className={navButtonClass('fw-x4-quickset', 'sidebar-child nested')}
                 onClick={() => onChangePage('fw-x4-quickset')}
               >
-                QuickSet (X4)
+                RCU Tests
               </button>
             </div>
           )}

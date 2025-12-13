@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from ..adb_service import AdbPrecheckResult, AdbPrecheckStatus, precheck
@@ -38,14 +43,20 @@ from src.adb.adb_client import ADBClient  # noqa: E402
 from src.qa.step_logger import StepLogger  # noqa: E402
 from src.quickset.scenarios.tv_auto_sync import TvAutoSyncScenario  # noqa: E402
 
+from ..live_button_workflow import configure_live_mapping, live_phase_press
+
 RAW_LOG_DIR = PROJECT_ROOT / "artifacts" / "quickset_logs"
+LIVE_LOG_DIR = PROJECT_ROOT / "backend" / "artifacts" / "live_logs"
 STEP_LOG_DIR = Path(settings.quickset_steps_dir)
 KNOWLEDGE_PATH = PROJECT_ROOT / "knowledge" / "scenarios" / "tv_auto_sync.yaml"
 
 RAW_LOG_DIR.mkdir(parents=True, exist_ok=True)
+LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
 STEP_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 router = APIRouter(prefix="/quickset", tags=["quickset"])
+logger = logging.getLogger(__name__)
+_workflow_threads: Dict[str, threading.Thread] = {}
 
 BOOLEAN_QUESTION_IDS = {
     "tv_volume_changed",
@@ -60,6 +71,7 @@ class RunScenarioRequest(BaseModel):
     tester_id: str = Field(..., alias="tester_id")
     stb_ip: str = Field(..., alias="stb_ip")
     scenario_name: str = Field(..., alias="scenario_name")
+    expected_channel: Optional[int] = Field(None, alias="expected_channel")
 
     class Config:
         allow_population_by_field_name = True
@@ -86,12 +98,20 @@ def require_api_key(x_quickset_api_key: str = Header(..., alias="X-QuickSet-Api-
 @router.post("/scenarios/run", response_model=RunScenarioResponse, status_code=status.HTTP_201_CREATED)
 def run_scenario(
     payload: RunScenarioRequest,
-    background_tasks: BackgroundTasks,
     api_key: str = Depends(require_api_key),
 ) -> RunScenarioResponse:
     scenario_name = payload.scenario_name.upper()
-    if scenario_name != "TV_AUTO_SYNC":
+    handler_map: Dict[str, Callable[..., None]] = {
+        "TV_AUTO_SYNC": _execute_tv_auto_sync,
+        "LIVE_BUTTON_MAPPING": _execute_live_button_mapping,
+    }
+    handler = handler_map.get(scenario_name)
+    if handler is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scenario")
+
+    expected_channel_value: Optional[int] = None
+    if scenario_name == "LIVE_BUTTON_MAPPING":
+        expected_channel_value = _safe_int(payload.expected_channel, 3)
 
     session = quickset_session_store.create_session(
         tester_id=payload.tester_id,
@@ -99,8 +119,18 @@ def run_scenario(
         scenario_name=scenario_name,
     )
     quickset_session_store.create_quickset_runtime(session.session_id)
+    _record_test_started_step(session.session_id, scenario_name, payload.tester_id)
 
-    background_tasks.add_task(_execute_tv_auto_sync, session.session_id, payload.tester_id, payload.stb_ip)
+    if scenario_name == "LIVE_BUTTON_MAPPING":
+        _launch_workflow_thread(
+            handler,
+            session.session_id,
+            payload.tester_id,
+            payload.stb_ip,
+            expected_channel_value,
+        )
+    else:
+        _launch_workflow_thread(handler, session.session_id, payload.tester_id, payload.stb_ip)
 
     return RunScenarioResponse(session_id=session.session_id, scenario_name=session.scenario_name)
 
@@ -422,10 +452,360 @@ def _execute_tv_auto_sync(session_id: str, tester_id: str, stb_ip: str) -> None:
     )
 
 
+def _execute_live_button_mapping(
+    session_id: str,
+    tester_id: str,
+    stb_ip: str,
+    expected_channel_override: Optional[int] = None,
+) -> None:
+    raw_dir = RAW_LOG_DIR / session_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    step_logger = QuickSetStepLogger(session_id=session_id, output_dir=STEP_LOG_DIR)
+    quickset_session_store.set_state(session_id, "running")
+
+    precheck_result = _run_adb_precheck(session_id, step_logger, stb_ip)
+    if precheck_result.status is not AdbPrecheckStatus.OK:
+        return
+
+    logcat_path = LIVE_LOG_DIR / f"live_{session_id}.log"
+    final_status = "fail"
+    final_summary = ""
+    adb_client = ADBClient(stb_ip)
+    expected_channel = _safe_int(expected_channel_override, 3)
+    live_log_proc: Optional[subprocess.Popen] = None
+    live_log_handle: Optional[Any] = None
+    logcat_started = False
+    restart_live_log_capture_cb: Optional[Callable[[], None]] = None
+
+    step_logger.log_step(
+        "live_expected_channel",
+        "INFO",
+        {
+            "expected_channel": expected_channel,
+            "source": "session_start_payload",
+            "tester_visible": False,
+        },
+    )
+
+    try:
+        step_logger.log_step(
+            "logcat_capture_start",
+            "INFO",
+            {"log_path": str(logcat_path), "tester_visible": False},
+        )
+        try:
+            logcat_path, live_log_proc, live_log_handle = _start_live_log_capture(adb_client, session_id)
+            logcat_started = True
+            step_logger.log_step(
+                "logcat_capture_start",
+                "PASS",
+                {"log_path": str(logcat_path), "tester_visible": False},
+            )
+
+            def _restart_live_log_capture_inner() -> None:
+                nonlocal live_log_proc, live_log_handle, logcat_path, logcat_started
+                try:
+                    _stop_live_log_capture(live_log_proc, live_log_handle)
+                except Exception:
+                    pass
+                logcat_path, live_log_proc, live_log_handle = _start_live_log_capture(
+                    adb_client,
+                    session_id,
+                    append=True,
+                    existing_path=logcat_path,
+                )
+                logcat_started = True
+
+            restart_live_log_capture_cb = _restart_live_log_capture_inner
+
+        except Exception as exc:  # noqa: BLE001
+            step_logger.log_step(
+                "logcat_capture_start",
+                "FAIL",
+                {"error": str(exc), "log_path": str(logcat_path), "tester_visible": False},
+            )
+            raise
+
+        phase_steps = [
+            ("phase1_live_press", "PHASE1", {"do_force_stop": False, "do_reboot": False}),
+            ("phase2_kill_and_relaunch", "PHASE2", {"do_force_stop": True, "do_reboot": False}),
+            (
+                "phase3_reboot_persist",
+                "PHASE3",
+                {
+                    "do_force_stop": False,
+                    "do_reboot": True,
+                    "post_reboot_callback": restart_live_log_capture_cb,
+                },
+            ),
+        ]
+
+        step_logger.log_step(
+            "configure_live_mapping",
+            "RUNNING",
+            {"expected_channel": expected_channel, "tester_visible": False},
+        )
+        try:
+            configure_live_mapping(adb_client, expected_channel)
+            step_logger.log_step(
+                "configure_live_mapping",
+                "PASS",
+                {"expected_channel": expected_channel, "tester_visible": False},
+            )
+        except Exception as exc:
+            step_logger.log_step(
+                "configure_live_mapping",
+                "FAIL",
+                {"expected_channel": expected_channel, "error": str(exc), "tester_visible": False},
+            )
+            _mark_live_phases_skipped(step_logger, phase_steps, expected_channel, str(exc))
+            raise
+
+        for step_name, phase_label, options in phase_steps:
+            step_logger.log_step(
+                step_name,
+                "RUNNING",
+                {"expected_channel": expected_channel, "phase": phase_label, "tester_visible": False},
+            )
+            try:
+                live_phase_press(
+                    adb_client,
+                    phase_label,
+                    expected_channel,
+                    do_force_stop=options.get("do_force_stop", False),
+                    do_reboot=options.get("do_reboot", False),
+                    post_reboot_callback=options.get("post_reboot_callback"),
+                )
+                step_logger.log_step(
+                    step_name,
+                    "PASS",
+                    {"expected_channel": expected_channel, "phase": phase_label, "tester_visible": False},
+                )
+            except Exception as exc:
+                step_logger.log_step(
+                    step_name,
+                    "FAIL",
+                    {
+                        "expected_channel": expected_channel,
+                        "phase": phase_label,
+                        "error": str(exc),
+                        "tester_visible": False,
+                    },
+                )
+                raise
+
+        final_summary = (
+            f"Live button automation completed for expected channel {expected_channel}. "
+            "Analyzer will determine the final verdict from logs."
+        )
+        final_status = "pass"
+    except Exception as exc:  # noqa: BLE001
+        final_summary = f"Live button automation failed: {exc}"
+        step_logger.log_step("scenario_exception", "FAIL", {"error": str(exc)})
+        final_status = "fail"
+    finally:
+        if logcat_started:
+            try:
+                _stop_live_log_capture(live_log_proc, live_log_handle)
+                step_logger.log_step(
+                    "logcat_capture_stop",
+                    "PASS",
+                    {"log_path": str(logcat_path), "tester_visible": False},
+                )
+            except Exception as exc:  # noqa: BLE001
+                step_logger.log_step("logcat_capture_stop", "FAIL", {"error": str(exc)})
+        summary_status = "INFO" if final_status == "pass" else "FAIL"
+        step_logger.log_step(
+            "analysis_summary",
+            summary_status,
+            {"analysis": final_summary, "expected_channel": expected_channel, "tester_visible": False},
+        )
+        step_logger.log_step(
+            "test_completed",
+            summary_status,
+            {"expected_channel": expected_channel, "tester_visible": False},
+        )
+        step_logger.close()
+
+    adb_log = _read_text(step_logger.log_path)
+    logcat_log = _read_text(logcat_path)
+
+    remote_keys = _extract_remote_keys(logcat_log)
+    if remote_keys:
+        quickset_session_store.set_remote_keys(session_id, remote_keys)
+
+    if not final_summary:
+        final_summary = "Live Button Mapping run completed."
+
+    snapshot = quickset_session_store.get_session(session_id)
+    if snapshot:
+        _sync_analysis_summary_step(session_id, snapshot.steps, final_status, final_summary)
+
+    quickset_session_store.finalize_session(
+        session_id,
+        result=final_status,
+        logs={"adb": adb_log, "logcat": logcat_log},
+        summary=final_summary or None,
+    )
+
+
 def _read_text(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _start_live_log_capture(
+    adb_client: ADBClient,
+    session_id: str,
+    *,
+    append: bool = False,
+    existing_path: Optional[Path] = None,
+) -> Tuple[Path, subprocess.Popen, Any]:
+    LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = existing_path or (LIVE_LOG_DIR / f"live_{session_id}.log")
+    mode = "a" if append and log_path.exists() else "w"
+    log_file = open(log_path, mode, encoding="utf-8", errors="ignore")
+    cmd = [adb_client.adb_path, "-s", adb_client.target, "logcat", "-b", "all", "-v", "threadtime"]
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+    return log_path, proc, log_file
+
+
+def _stop_live_log_capture(proc: Optional[subprocess.Popen], handle: Optional[Any]) -> None:
+    if proc is not None:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        proc = None
+    if handle is not None and not handle.closed:
+        handle.close()
+
+
+def _mark_live_phases_skipped(
+    step_logger: QuickSetStepLogger,
+    phase_steps: List[Tuple[str, str, Dict[str, Any]]],
+    expected_channel: int,
+    reason: str,
+) -> None:
+    for step_name, phase_label, _ in phase_steps:
+        step_logger.log_step(
+            step_name,
+            "INFO",
+            {
+                "expected_channel": expected_channel,
+                "phase": phase_label,
+                "skipped_due_to_config_error": True,
+                "reason": reason,
+                "tester_visible": False,
+            },
+        )
+# --------------------------------------------------------------------------- #
+# Worker orchestration helpers
+# --------------------------------------------------------------------------- #
+
+
+def _launch_workflow_thread(
+    handler: Callable[..., None],
+    session_id: str,
+    *args: Any,
+) -> None:
+    thread = threading.Thread(
+        target=_run_workflow_safe,
+        args=(handler, session_id, *args),
+        name=f"quickset-{session_id}",
+        daemon=True,
+    )
+    _workflow_threads[session_id] = thread
+    thread.start()
+
+
+def _run_workflow_safe(
+    handler: Callable[..., None],
+    session_id: str,
+    *args: Any,
+) -> None:
+    try:
+        handler(session_id, *args)
+    except asyncio.CancelledError:
+        logger.info("QuickSet session %s cancelled", session_id)
+        _ensure_session_completed(
+            session_id,
+            result="fail",
+            summary="QuickSet session cancelled before completion.",
+            metadata={"cancelled": True},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("QuickSet session %s crashed: %s", session_id, exc)
+        _ensure_session_completed(
+            session_id,
+            result="fail",
+            summary=f"QuickSet automation failed: {exc}",
+            metadata={"error": str(exc)},
+        )
+    finally:
+        _workflow_threads.pop(session_id, None)
+
+
+def _record_test_started_step(session_id: str, scenario_name: str, tester_id: str) -> None:
+    _append_quickset_step(
+        session_id,
+        "test_started",
+        "info",
+        {
+            "scenario_name": scenario_name,
+            "tester_id": tester_id,
+            "tester_visible": False,
+        },
+    )
+
+
+def _append_quickset_step(session_id: str, name: str, status: str, metadata: Dict[str, Any] | None = None) -> None:
+    quickset_session_store.append_step(
+        session_id,
+        QuickSetStep(
+            name=name,
+            status=status,
+            timestamp=datetime.utcnow(),
+            metadata=metadata or {},
+        ),
+    )
+
+
+def _ensure_session_completed(
+    session_id: str,
+    *,
+    result: str,
+    summary: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    session = quickset_session_store.get_session(session_id)
+    if not session or session.state == "completed":
+        return
+    merged_metadata = {"tester_visible": False}
+    if metadata:
+        merged_metadata.update(metadata)
+    _append_quickset_step(session_id, "test_completed", result or "fail", merged_metadata)
+    existing_logs = dict(session.logs or {})
+    quickset_session_store.finalize_session(
+        session_id,
+        result=result or "fail",
+        logs=existing_logs,
+        summary=summary or result.upper(),
+    )
+
+
+
+def _safe_int(value: Optional[str], default: int = 3) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(str(value).strip())
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _split_target(raw: str) -> tuple[str, int]:

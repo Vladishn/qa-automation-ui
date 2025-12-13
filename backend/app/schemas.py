@@ -176,7 +176,7 @@ class QuickSetAnswer(BaseModel):
     answer: str
 
 
-TvAutoSyncStatus = Literal["PASS", "FAIL", "INFO", "AWAITING_INPUT", "PENDING"]
+TvAutoSyncStatus = Literal["PASS", "FAIL", "INFO", "AWAITING_INPUT", "PENDING", "INCONCLUSIVE"]
 
 
 class TvAutoSyncTimelineEvent(BaseModel):

@@ -5,6 +5,7 @@ import { DashboardCard } from '../components/layout/DashboardCard';
 import { StbIpField } from '../components/fields/StbIpField';
 import type { QuickSetQuestion } from '../types/domain';
 import type {
+  AnalyzerStepStatus,
   MetricTriState,
   QuicksetAnalysisDetails,
   TvAutoSyncTimelineEvent,
@@ -12,18 +13,33 @@ import type {
 } from '../types/quickset';
 import { deriveUiStatusFromAnalyzer } from '../logic/quicksetStatus';
 import { deriveMetricStatuses, type MetricStatusesResult } from '../logic/quicksetMetrics';
-import { runScenario, answerQuestion } from '../services/quicksetService';
+import { runScenario, answerQuestion, type QuicksetScenarioId } from '../services/quicksetService';
 import { useSessionPolling } from '../hooks/useSessionPolling';
 
 
 const defaultForm = {
   testerId: '',
   stbIp: '',
-  apiKey: ''
+  apiKey: '',
+  expectedChannel: '3'
 };
 
-const scenarioOptions = [{ value: 'TV_AUTO_SYNC' as const, label: 'TV Auto Sync' }];
+const RCU_SCENARIOS: ReadonlyArray<{ id: QuicksetScenarioId; label: string }> = [
+  { id: 'TV_AUTO_SYNC', label: 'TV Auto Sync' },
+  { id: 'LIVE_BUTTON_MAPPING', label: 'Live Button Mapping' }
+];
 type TimelineRowWithStatus = TvAutoSyncTimelineEvent & { statusDisplay?: AnalyzerStepStatus | MetricTriState };
+const INITIAL_SESSION_HISTORY: Record<QuicksetScenarioId, string | null> = {
+  TV_AUTO_SYNC: null,
+  LIVE_BUTTON_MAPPING: null
+};
+const isFinalAnalyzerStatus = (value?: string | null): boolean => {
+  if (!value) {
+    return false;
+  }
+  const normalized = value.toUpperCase();
+  return normalized === 'PASS' || normalized === 'FAIL' || normalized === 'INCONCLUSIVE';
+};
 
 const formatDateTime = (value?: string | null): string => {
   if (!value) return '—';
@@ -75,23 +91,43 @@ const pickTriState = (value: unknown): MetricTriState | undefined => {
 
 const QuickSetRunner: React.FC = () => {
   const [form, setForm] = useState(defaultForm);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [lastSessionByScenario, setLastSessionByScenario] =
+    useState<Record<QuicksetScenarioId, string | null>>(() => ({ ...INITIAL_SESSION_HISTORY }));
   const [activeApiKey, setActiveApiKey] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [answerError, setAnswerError] = useState<string | null>(null);
   const [answerText, setAnswerText] = useState('');
   const [isAnswerSubmitting, setIsAnswerSubmitting] = useState(false);
+  const [selectedScenarioId, setSelectedScenarioId] = useState<QuicksetScenarioId>('TV_AUTO_SYNC');
+  const [completionBanner, setCompletionBanner] = useState<{ sessionId: string; timestamp: number } | null>(null);
 
   const { data: sessionData, error: pollError, setData: setSessionEnvelope } =
-    useSessionPolling(sessionId, activeApiKey);
+    useSessionPolling(selectedSessionId, activeApiKey);
 
   const analyzerSession = sessionData?.session ?? null;
   const runtimeSession = sessionData?.quickset_session ?? null;
   const timeline = (sessionData?.timeline ?? []) as TvAutoSyncTimelineEvent[];
   const pendingQuestion = runtimeSession?.pending_question ?? null;
+  const analyzerFinished = Boolean(
+    analyzerSession &&
+      (analyzerSession.finished_at || isFinalAnalyzerStatus(analyzerSession.overall_status))
+  );
 
-  const scenarioName = 'TV_AUTO_SYNC' as const;
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setCompletionBanner(null);
+      return;
+    }
+    if (analyzerFinished) {
+      setCompletionBanner((prev) =>
+        prev?.sessionId === selectedSessionId ? prev : { sessionId: selectedSessionId, timestamp: Date.now() }
+      );
+    } else if (completionBanner?.sessionId === selectedSessionId) {
+      setCompletionBanner(null);
+    }
+  }, [selectedSessionId, analyzerFinished, completionBanner?.sessionId]);
 
   const handleChange =
     (field: keyof typeof form) =>
@@ -99,26 +135,49 @@ const QuickSetRunner: React.FC = () => {
       setForm((prev) => ({ ...prev, [field]: event.target.value }));
     };
 
+  const currentScenarioLabel = useMemo(() => {
+    return RCU_SCENARIOS.find((scenario) => scenario.id === selectedScenarioId)?.label ?? 'TV Auto Sync';
+  }, [selectedScenarioId]);
+
   const handleStartScenario = async () => {
     setSubmitError(null);
 
-    if (!form.testerId || !form.stbIp || !form.apiKey) {
+    const trimmedTester = form.testerId.trim();
+    const trimmedIp = form.stbIp.trim();
+    const trimmedKey = form.apiKey.trim();
+    if (!trimmedTester || !trimmedIp || !trimmedKey) {
       setSubmitError('Tester ID, STB IP, and API key are required.');
       return;
+    }
+
+    let expectedChannelValue: number | undefined;
+    if (selectedScenarioId === 'LIVE_BUTTON_MAPPING') {
+      const parsed = Number(form.expectedChannel);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 9999) {
+        setSubmitError('Expected channel must be an integer between 1 and 9999.');
+        return;
+      }
+      expectedChannelValue = parsed;
     }
 
     try {
       setIsSubmitting(true);
       const response = await runScenario({
-        testerId: form.testerId,
-        stbIp: form.stbIp,
-        apiKey: form.apiKey,
-        scenarioName
+        testerId: trimmedTester,
+        stbIp: trimmedIp,
+        apiKey: trimmedKey,
+        scenarioName: selectedScenarioId,
+        expectedChannel: expectedChannelValue
       });
-      setSessionId(response.session_id);
-      setActiveApiKey(form.apiKey);
+      setLastSessionByScenario((prev) => ({
+        ...prev,
+        [selectedScenarioId]: response.session_id
+      }));
+      setSelectedSessionId(response.session_id);
+      setActiveApiKey(trimmedKey);
       setSessionEnvelope(null);
       setAnswerText('');
+      setCompletionBanner(null);
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : 'Failed to run scenario');
     } finally {
@@ -161,15 +220,29 @@ const QuickSetRunner: React.FC = () => {
     };
   }, [analyzerSession, analysisDetails]);
   const timelineForDisplay: TimelineRowWithStatus[] | null = timeline ?? null;
+  const handleScenarioSelect = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const nextScenario = event.target.value as QuicksetScenarioId;
+    setSelectedScenarioId(nextScenario);
+    const nextSession = lastSessionByScenario[nextScenario] ?? null;
+    setSelectedSessionId(nextSession);
+    setSessionEnvelope(null);
+    setAnswerText('');
+    if (nextScenario === 'LIVE_BUTTON_MAPPING' && !form.expectedChannel) {
+      setForm((prev) => ({ ...prev, expectedChannel: '3' }));
+    }
+    if (!nextSession) {
+      setCompletionBanner(null);
+    }
+  };
 
   const submitAnswer = async (value: string) => {
-    if (!sessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {
+    if (!selectedSessionId || !activeApiKey || !pendingQuestion || isAnswerSubmitting) {
       return;
     }
     try {
       setAnswerError(null);
       setIsAnswerSubmitting(true);
-      const updated = await answerQuestion(sessionId, activeApiKey, value);
+      const updated = await answerQuestion(selectedSessionId, activeApiKey, value);
       setSessionEnvelope(updated);
       setAnswerText('');
     } catch (error) {
@@ -180,7 +253,7 @@ const QuickSetRunner: React.FC = () => {
   };
 
   const renderQuestionControls = (question: QuickSetQuestion) => {
-    const disabled = isAnswerSubmitting || !sessionId || !activeApiKey;
+    const disabled = isAnswerSubmitting || !selectedSessionId || !activeApiKey;
 
     if (question.input_kind === 'continue') {
       return (
@@ -244,7 +317,8 @@ const QuickSetRunner: React.FC = () => {
 
   const sessionActive = Boolean(
     runtimeSession &&
-      sessionId &&
+      selectedSessionId &&
+      runtimeSession.session_id === selectedSessionId &&
       (runtimeSession.state === 'running' || runtimeSession.state === 'awaiting_input')
   );
 
@@ -253,7 +327,7 @@ const QuickSetRunner: React.FC = () => {
   const finishedAt = formatDateTime(analyzerSession?.finished_at);
 
   const renderQuicksetSummary = () => {
-    if (!sessionId) {
+    if (!selectedSessionId) {
       return <p className="hint">Run a session to see the QuickSet analysis summary.</p>;
     }
     if (!analyzerSession) {
@@ -271,9 +345,9 @@ const QuickSetRunner: React.FC = () => {
   return (
     <div className="mx-auto w-full max-w-[1400px] space-y-6 px-4 py-10 sm:px-6 lg:px-8">
       <div className="space-y-3">
-        <h2 className="page-title">QuickSet Runner · TV_AUTO_SYNC</h2>
+        <h2 className="page-title">RCU Tests</h2>
         <p className="page-subtitle">
-          Execute the real TV_AUTO_SYNC scenario via QuickSet. Enter tester details, STB IP, and API
+          Execute the {currentScenarioLabel} scenario via QuickSet. Enter tester details, STB IP, and API
           key to kick off the flow and monitor progress, steps, and logs in real time.
         </p>
       </div>
@@ -303,12 +377,12 @@ const QuickSetRunner: React.FC = () => {
             <label className="flex flex-col space-y-1 text-sm font-medium">
               <span>Scenario</span>
               <select
-                value={scenarioName}
-                disabled
+                value={selectedScenarioId}
+                onChange={handleScenarioSelect}
                 className="mt-0 w-full rounded-lg border border-white/20 bg-transparent p-2 text-sm"
               >
-                {scenarioOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
+                {RCU_SCENARIOS.map((option) => (
+                  <option key={option.id} value={option.id}>
                     {option.label}
                   </option>
                 ))}
@@ -357,6 +431,29 @@ const QuickSetRunner: React.FC = () => {
               />
             </label>
 
+            {selectedScenarioId === 'LIVE_BUTTON_MAPPING' && (
+              <label className="flex flex-col space-y-1 text-sm font-medium">
+                <span>Expected channel</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={9999}
+                  name="expectedChannel"
+                  value={form.expectedChannel}
+                  onChange={(event) =>
+                    setForm((prev) => ({ ...prev, expectedChannel: event.target.value }))
+                  }
+                  placeholder="3"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  style={inputStyle}
+                  disabled={isSubmitting || sessionActive}
+                />
+              </label>
+            )}
+
             <button
               type="button"
               onClick={handleStartScenario}
@@ -373,7 +470,7 @@ const QuickSetRunner: React.FC = () => {
             <div>
               <dt className="text-xs uppercase tracking-wide text-slate-400">Session ID</dt>
               <dd className="text-sm font-mono text-slate-100">
-                {runtimeSession?.session_id || sessionId || '—'}
+                {runtimeSession?.session_id || selectedSessionId || '—'}
               </dd>
             </div>
             <div>
@@ -391,7 +488,7 @@ const QuickSetRunner: React.FC = () => {
             <div>
               <dt className="text-xs uppercase tracking-wide text-slate-400">Scenario</dt>
               <dd className="text-sm text-slate-100">
-                {runtimeSession?.scenario_name || scenarioName}
+                {runtimeSession?.scenario_name || selectedScenarioId}
               </dd>
             </div>
             <div className="flex flex-col">
@@ -435,6 +532,12 @@ const QuickSetRunner: React.FC = () => {
         </DashboardCard>
       </div>
 
+      {completionBanner?.sessionId === selectedSessionId && (
+        <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-sm text-emerald-200">
+          Test completed for session {completionBanner.sessionId}.
+        </div>
+      )}
+
       {/* SECOND ROW: Summary + Timeline */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2 items-stretch">
         <DashboardCard title="QuickSet Summary" className="h-full flex flex-col" bodyClassName="flex-1 flex flex-col">
@@ -446,7 +549,7 @@ const QuickSetRunner: React.FC = () => {
           className="h-full flex flex-col"
           bodyClassName="px-0 pb-0 flex-1 flex flex-col"
         >
-          <StepsTimeline sessionId={sessionId} rows={timelineForDisplay} />
+          <StepsTimeline sessionId={selectedSessionId} rows={timelineForDisplay} />
         </DashboardCard>
       </div>
 

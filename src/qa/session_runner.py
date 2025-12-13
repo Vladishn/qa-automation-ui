@@ -26,6 +26,10 @@ class SessionRunner:
             "src.quickset.scenarios.remote_pair_unpair",
             "RemotePairUnpairScenario",
         ),
+        "live_button_mapping": (
+            "src.quickset.scenarios.live_button_mapping",
+            "LiveButtonMappingScenario",
+        ),
     }
 
     def __init__(self, project_root: Path) -> None:
@@ -85,6 +89,13 @@ class SessionRunner:
                 adb,
                 logger,
                 knowledge_path=self.tv_auto_sync_knowledge,
+                raw_log_dir=self.raw_log_dir,
+                session_id=session_id,
+            )
+        if scenario_name == "live_button_mapping":
+            return scenario_cls(
+                adb,
+                logger,
                 raw_log_dir=self.raw_log_dir,
                 session_id=session_id,
             )

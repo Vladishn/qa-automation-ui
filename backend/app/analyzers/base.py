@@ -30,6 +30,7 @@ AnalyzerStatus = Literal[
     "PENDING",
     "INFO",
     "AWAITING_INPUT",
+    "INCONCLUSIVE",
 ]
 
 ConfidenceLevel = Literal["low", "medium", "high"]
