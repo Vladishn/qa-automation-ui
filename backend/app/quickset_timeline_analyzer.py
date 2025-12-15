@@ -12,6 +12,7 @@ from pathlib import Path
 from .analyzers.base import AnalyzerResult, FailureInsight
 from .quickset_log_parser import QuicksetLogSignals, parse_quickset_logs
 from .live_button_log_parser import LiveButtonSignals, parse_live_button_logs
+from .scenario_enums import ScenarioName
 
 # QuickSet log parsing relies on QuicksetLogSignals/parse_quickset_logs as the
 # single source of truth for TV_AUTO_SYNC log evidence.
@@ -662,21 +663,23 @@ def build_timeline_and_summary(
     before_snap = snapshots.get(STATE_LABEL_BEFORE)
     after_snap = snapshots.get(STATE_LABEL_AFTER)
 
-    resolved_scenario_name = scenario_name or "UNKNOWN"
-    if not resolved_scenario_name or resolved_scenario_name.upper() == "UNKNOWN":
-        resolved_scenario_name = _infer_scenario_name(raw_events)
-    upper_scenario = resolved_scenario_name.upper()
+    if not scenario_name:
+        raise ValueError("Scenario name is required for analyzer dispatch.")
+    try:
+        scenario_enum = ScenarioName(scenario_name.upper())
+    except ValueError as exc:
+        raise ValueError(f"Unsupported scenario for analyzer: {scenario_name}") from exc
 
     user_answers = _extract_user_answers(raw_events)
     volume_probe = _extract_volume_probe(raw_events, user_answers)
     log_brand = _derive_log_brand(before_snap, after_snap, raw_events)
-    live_log_text = load_live_button_log_text(session_id) if upper_scenario == "LIVE_BUTTON_MAPPING" else ""
-    log_text = live_log_text or load_logcat_text(session_id, resolved_scenario_name)
+    live_log_text = load_live_button_log_text(session_id) if scenario_enum is ScenarioName.LIVE_BUTTON_MAPPING else ""
+    log_text = live_log_text or load_logcat_text(session_id, scenario_enum.value)
     log_evidence = analyze_log_evidence(log_text, log_brand)
     live_log_excerpt = live_log_text or log_text
     expected_channel_value = _resolve_expected_channel(user_answers, raw_events)
     log_signals: Optional[QuicksetLogSignals] = None
-    if upper_scenario == "TV_AUTO_SYNC":
+    if scenario_enum is ScenarioName.TV_AUTO_SYNC:
         log_signals = parse_quickset_logs(log_text)
         _merge_quickset_signals(log_evidence, log_signals)
         autosync_started_flag = bool(getattr(log_signals, "autosync_started", False))
@@ -694,7 +697,7 @@ def build_timeline_and_summary(
         log_evidence=log_evidence,
     )
 
-    if upper_scenario == "LIVE_BUTTON_MAPPING":
+    if scenario_enum is ScenarioName.LIVE_BUTTON_MAPPING:
         live_signals = parse_live_button_logs(
             log_text,
             expected_channel_value,
@@ -702,7 +705,7 @@ def build_timeline_and_summary(
         )
         summary, analyzer_result = _build_live_button_session_summary(
             session_id=session_id,
-            scenario_name=resolved_scenario_name,
+            scenario_name=scenario_enum.value,
             raw_events=raw_events,
             timeline_rows=timeline_rows,
             user_answers=user_answers,
@@ -713,7 +716,7 @@ def build_timeline_and_summary(
     else:
         summary, analyzer_result = _build_session_summary(
             session_id=session_id,
-            scenario_name=resolved_scenario_name,
+            scenario_name=scenario_enum.value,
             raw_events=raw_events,
             timeline_rows=timeline_rows,
             log_brand=log_evidence.log_brand,
@@ -1894,10 +1897,23 @@ def _build_live_button_session_summary(
     def _add_live_root_cause(code: str, description: str) -> None:
         _add_root_cause(root_causes, recommendations, code, description)
 
-    config_attempted = bool(getattr(live_signals, "config_attempted", False))
+    config_details = dict(config_row.details or {}) if config_row else {}
+    ui_prompt_detected = bool(config_details.get("ui_prompt_detected"))
+    ui_value_after_raw = config_details.get("value_after")
+    try:
+        ui_value_after = int(ui_value_after_raw) if ui_value_after_raw is not None else None
+    except (TypeError, ValueError):
+        ui_value_after = None
+    ui_confirm_method = config_details.get("confirm_method_used")
+
+    if ui_prompt_detected and not getattr(live_signals, "config_screen_detected", False):
+        live_signals.config_screen_detected = True
+    if ui_value_after is not None and expected_channel is not None and ui_value_after == expected_channel:
+        live_signals.config_verified = True
+    config_attempted = bool(getattr(live_signals, "config_attempted", False)) or ui_prompt_detected
     config_verified = bool(getattr(live_signals, "config_verified", False))
-    session_logs_found = bool(getattr(live_signals, "session_logs_found", True))
-    config_screen_detected = bool(getattr(live_signals, "config_screen_detected", False))
+    session_logs_found = bool(getattr(live_signals, "session_logs_found", True) or ui_prompt_detected)
+    config_screen_detected = bool(getattr(live_signals, "config_screen_detected", False) or ui_prompt_detected)
     phase_data_present = bool(live_signals and live_signals.phases)
     no_live_signals = (
         live_signals is None
@@ -1927,6 +1943,10 @@ def _build_live_button_session_summary(
                 "config_attempted": config_attempted,
                 "config_verified": config_verified,
                 "session_logs_found": session_logs_found,
+                "config_screen_detected": config_screen_detected,
+                "ui_prompt_detected": ui_prompt_detected,
+                "ui_value_after": ui_value_after,
+                "ui_confirm_method": ui_confirm_method,
                 "phases": [
                     {
                         "phase": phase.phase,
@@ -1938,7 +1958,6 @@ def _build_live_button_session_summary(
                 ],
                 "raw_excerpt": raw_excerpt_snippet,
                 "no_markers_found": no_markers_found,
-                "config_screen_detected": config_screen_detected,
             },
         }
 
@@ -2016,6 +2035,9 @@ def _build_live_button_session_summary(
                 "config_attempted": config_attempted,
                 "config_verified": config_verified,
                 "config_screen_detected": config_screen_detected,
+                "ui_prompt_detected": ui_prompt_detected,
+                "ui_value_after": ui_value_after,
+                "ui_confirm_method": ui_confirm_method,
                 "session_logs_found": session_logs_found,
                 "phases": [
                     {

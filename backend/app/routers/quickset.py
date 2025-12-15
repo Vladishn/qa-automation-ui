@@ -26,6 +26,7 @@ from ..models import (
     QuickSetStep,
 )
 from ..quickset_timeline_analyzer import build_timeline_and_summary
+from ..scenario_enums import ScenarioName
 from ..regression_snapshots import save_session_snapshot
 from ..schemas import (
     TvAutoSyncSession,
@@ -44,6 +45,7 @@ from src.qa.step_logger import StepLogger  # noqa: E402
 from src.quickset.scenarios.tv_auto_sync import TvAutoSyncScenario  # noqa: E402
 
 from ..live_button_workflow import (
+    LiveConfigurationError,
     configure_live_mapping,
     ensure_device_focus_ready,
     live_phase_press,
@@ -104,19 +106,30 @@ def run_scenario(
     payload: RunScenarioRequest,
     api_key: str = Depends(require_api_key),
 ) -> RunScenarioResponse:
-    scenario_name = payload.scenario_name.upper()
-    handler_map: Dict[str, Callable[..., None]] = {
-        "TV_AUTO_SYNC": _execute_tv_auto_sync,
-        "LIVE_BUTTON_MAPPING": _execute_live_button_mapping,
+    scenario_raw = (payload.scenario_name or "").strip().upper()
+    try:
+        scenario_enum = ScenarioName(scenario_raw)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scenario")
+
+    handler_map: Dict[ScenarioName, Callable[..., None]] = {
+        ScenarioName.TV_AUTO_SYNC: _execute_tv_auto_sync,
+        ScenarioName.LIVE_BUTTON_MAPPING: _execute_live_button_mapping,
     }
-    handler = handler_map.get(scenario_name)
+    handler = handler_map.get(scenario_enum)
     if handler is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scenario")
 
     expected_channel_value: Optional[int] = None
-    if scenario_name == "LIVE_BUTTON_MAPPING":
+    if scenario_enum is ScenarioName.LIVE_BUTTON_MAPPING:
         expected_channel_value = _safe_int(payload.expected_channel, 3)
+    elif payload.expected_channel is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="expected_channel is only valid for LIVE_BUTTON_MAPPING",
+        )
 
+    scenario_name = scenario_enum.value
     session = quickset_session_store.create_session(
         tester_id=payload.tester_id,
         stb_ip=payload.stb_ip,
@@ -125,7 +138,7 @@ def run_scenario(
     quickset_session_store.create_quickset_runtime(session.session_id)
     _record_test_started_step(session.session_id, scenario_name, payload.tester_id)
 
-    if scenario_name == "LIVE_BUTTON_MAPPING":
+    if scenario_enum is ScenarioName.LIVE_BUTTON_MAPPING:
         _launch_workflow_thread(
             handler,
             session.session_id,
@@ -148,6 +161,8 @@ def get_session(
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
     dto, _ = _build_tv_autosync_envelope(session, include_runtime=True)
+    if dto.session.scenario_name != session.scenario_name:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Analyzer scenario mismatch")
     return dto
 
 
@@ -162,6 +177,8 @@ def get_quickset_session_snapshot(session_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QuickSet session not found")
 
     dto, analyzer_ready = _build_tv_autosync_envelope(session, include_runtime=False)
+    if dto.session.scenario_name != session.scenario_name:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Analyzer scenario mismatch")
     if not analyzer_ready:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Analyzer data not available for snapshot")
 
@@ -709,13 +726,30 @@ def _execute_live_button_mapping(
                 {"expected_channel": expected_channel, "tester_visible": False},
             )
             try:
-                configure_live_mapping(adb_client, session_id, expected_channel)
+                configure_details = configure_live_mapping(adb_client, session_id, expected_channel)
                 step_logger.log_step(
                     "configure_live_mapping",
                     "PASS",
-                    {"expected_channel": expected_channel, "tester_visible": False},
+                    {
+                        **configure_details,
+                        "expected_channel": expected_channel,
+                        "tester_visible": False,
+                    },
                 )
-            except Exception as exc:
+            except LiveConfigurationError as exc:
+                step_logger.log_step(
+                    "configure_live_mapping",
+                    "FAIL",
+                    {
+                        **exc.details,
+                        "expected_channel": expected_channel,
+                        "error": str(exc),
+                        "tester_visible": False,
+                    },
+                )
+                _mark_live_phases_skipped(step_logger, phase_steps, expected_channel, str(exc))
+                raise
+            except Exception as exc:  # noqa: BLE001
                 step_logger.log_step(
                     "configure_live_mapping",
                     "FAIL",
